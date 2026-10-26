@@ -1,0 +1,328 @@
+---
+title: "Árboles binomiales — Opciones americanas de TSLA (estrategia T2)"
+subtitle: "Productos Derivados — Tarea Clase 5"
+author: "Valeria Acosta, Melissa Arizoca, Maria Cecilia Cantú"
+lang: es
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Librerías (instalar una sola vez con install.packages() si faltan)
+library(tidyverse)     # dplyr, tidyr, ggplot2, tibble, purrr
+library(knitr)         # kable
+library(kableExtra)    # kable_styling
+library(igraph)        # graph_from_data_frame
+library(ggraph)        # ggraph, geom_edge_link, geom_node_label
+```
+
+# 1. Opciones seleccionadas
+
+Elegimos las dos legs de la estrategia **T2 — Long straddle 385** de Tesla: un call y un put americanos con strike de US\$385 y vencimiento el 18 de diciembre de 2026. Desde la fecha de valuación quedan 68 días (unos 2.2 meses), dentro del rango de 1 a 3 meses que pide la actividad.
+
+Los datos son los de nuestro portafolio: cadena de opciones de Refinitiv (LSEG Workspace) al cierre del 9 de octubre de 2026, con fecha de valuación del 11 de octubre (fecha a la que LSEG calcula la volatilidad implícita) y la tasa libre de riesgo usada en clase. Tesla no paga dividendo.
+
+```{r parametros}
+S0 <- 382.70                          # cierre de TSLA, 9-oct-2026
+K <- 385                              # strike de ambas patas
+r <- 0.0455                           # tasa libre de riesgo usada en clase
+q <- 0                                # TSLA no paga dividendo
+fecha_valuacion <- as.Date("2026-10-11")
+vencimiento <- as.Date("2026-12-18")
+dias <- as.numeric(vencimiento - fecha_valuacion)
+T <- dias / 365
+contratos <- 5                        # volumen de la estrategia T2
+
+mercado <- tribble(
+  ~opcion, ~bid,  ~ask,  ~iv,
+  "Call",  27.10, 27.55, 0.413751,
+  "Put",   26.30, 26.60, 0.404781
+) %>% mutate(mid = (bid + ask) / 2)
+
+# Para que call y put compartan el mismo árbol usamos la volatilidad ATM promedio
+sigma <- mean(mercado$iv)
+
+kable(mercado %>% mutate(iv = scales::percent(iv, 0.01)),
+      col.names = c("Opción", "Bid", "Ask", "IV mid", "Mid"),
+      caption = paste0("TSLA 385, vencimiento 18-dic-2026 (", dias, " días). Spot: US$", S0)) %>%
+  kable_styling(full_width = FALSE)
+```
+
+**Interpretación:** El call y el put tienen casi la misma volatilidad implícita (41.4% y 40.5%), así que usamos el promedio, `r scales::percent(sigma, 0.01)`, para construir un solo árbol del precio de Tesla y valuar las dos opciones sobre los mismos nodos. Así también podemos ver el valor de la estrategia completa en cada nodo.
+
+# 2. Función del árbol binomial
+
+Usamos el modelo de Cox-Ross-Rubinstein: $u = e^{\sigma\sqrt{\Delta t}}$, $d = 1/u$ y $p = \dfrac{e^{(r-q)\Delta t} - d}{u - d}$. Al ser opciones americanas, en cada nodo el valor es el máximo entre ejercer en ese momento y el valor descontado de esperar. La función regresa también delta, gamma y theta calculadas con los primeros nodos del árbol (Hull, cap. 21).
+
+```{r funcion-arbol}
+arbol_binomial <- function(S, K, T, r, q = 0, sigma, n, tipo = "call", americana = TRUE) {
+  dt <- T / n
+  u <- exp(sigma * sqrt(dt)); d <- 1 / u
+  p <- (exp((r - q) * dt) - d) / (u - d)
+  desc <- exp(-r * dt)
+  pago <- function(s) if (tipo == "call") pmax(s - K, 0) else pmax(K - s, 0)
+
+  precios <- valores <- ejerce <- vector("list", n + 1)
+  precios[[n + 1]] <- S * u^(n:0) * d^(0:n)          # posición 1 = todas subidas
+  valores[[n + 1]] <- pago(precios[[n + 1]])
+  ejerce[[n + 1]] <- rep(FALSE, n + 1)
+
+  for (i in (n - 1):0) {
+    precios[[i + 1]] <- S * u^(i:0) * d^(0:i)
+    esperar <- desc * (p * valores[[i + 2]][1:(i + 1)] + (1 - p) * valores[[i + 2]][2:(i + 2)])
+    ejercer <- pago(precios[[i + 1]])
+    valores[[i + 1]] <- if (americana) pmax(esperar, ejercer) else esperar
+    ejerce[[i + 1]] <- americana & ejercer > esperar & ejercer > 0
+  }
+
+  f1 <- valores[[2]]; f2 <- valores[[3]]; s1 <- precios[[2]]; s2 <- precios[[3]]
+  list(precio = valores[[1]][1],
+       delta = (f1[1] - f1[2]) / (s1[1] - s1[2]),
+       gamma = ((f2[1] - f2[2]) / (s2[1] - s2[2]) - (f2[2] - f2[3]) / (s2[2] - s2[3])) / (0.5 * (s2[1] - s2[3])),
+       theta = (f2[2] - valores[[1]][1]) / (2 * dt) / 365,
+       u = u, d = d, p = p, dt = dt, precios = precios, valores = valores, ejerce = ejerce)
+}
+
+# Dibuja un árbol: cada nodo con las etiquetas que regresa `etiqueta(paso, j)`
+graficar_arbol <- function(n, etiqueta, resaltar = NULL, titulo, subtitulo = NULL) {
+  nodos <- map_dfr(0:n, function(i) tibble(paso = i, bajadas = 0:i)) %>%
+    mutate(name = paste(paso, bajadas, sep = ","),
+           etiqueta = map2_chr(paso, bajadas, etiqueta),
+           resaltado = if (is.null(resaltar)) FALSE else map2_lgl(paso, bajadas, resaltar))
+  aristas <- nodos %>% filter(paso < n) %>%
+    transmute(from = name, a = paste(paso + 1, bajadas, sep = ","), b = paste(paso + 1, bajadas + 1, sep = ",")) %>%
+    pivot_longer(c(a, b), values_to = "to") %>% select(from, to)
+  grafo <- graph_from_data_frame(aristas, vertices = nodos %>% select(name, etiqueta, resaltado))
+  ggraph(grafo, layout = "manual", x = nodos$paso, y = nodos$paso / 2 - nodos$bajadas) +
+    geom_edge_link(color = "grey70") +
+    geom_node_label(aes(label = etiqueta, fill = resaltado), size = 2.7, label.padding = unit(0.15, "lines")) +
+    scale_fill_manual(values = c(`FALSE` = "white", `TRUE` = "#f4c7c3"), guide = "none") +
+    labs(title = titulo, subtitle = subtitulo) +
+    theme_void()
+}
+```
+
+# 3. Árbol del precio de Tesla (6 pasos)
+
+Para poder ver los nodos usamos 6 pasos de `r round(T / 6 * 365, 1)` días cada uno. Más adelante valuamos con 200 pasos.
+
+```{r arbol-precio, fig.width = 11, fig.height = 6.5}
+n_vis <- 6
+call6 <- arbol_binomial(S0, K, T, r, q, sigma, n_vis, "call")
+put6 <- arbol_binomial(S0, K, T, r, q, sigma, n_vis, "put")
+
+tibble(Parámetro = c("Δt (días)", "u", "d", "p (prob. neutral al riesgo de subir)", "1 − p"),
+       Valor = c(call6$dt * 365, call6$u, call6$d, call6$p, 1 - call6$p)) %>%
+  kable(digits = 4, caption = "Parámetros del árbol de 6 pasos") %>%
+  kable_styling(full_width = FALSE)
+
+graficar_arbol(n_vis, function(i, j) paste0("US$", round(call6$precios[[i + 1]][j + 1], 2)),
+               titulo = "Árbol binomial del precio de TSLA — 6 pasos al 18-dic-2026",
+               subtitulo = paste0("S0 = US$", S0, " | σ = ", scales::percent(sigma, 0.1),
+                                  " | u = ", round(call6$u, 4), ", d = ", round(call6$d, 4)))
+```
+
+**Interpretación:** Cada paso Tesla puede subir `r scales::percent(call6$u - 1, 0.1)` o bajar `r scales::percent(1 - call6$d, 0.1)`. Después de 6 pasos el precio va de US\$`r round(min(call6$precios[[7]]), 2)` a US\$`r round(max(call6$precios[[7]]), 2)`, un rango amplio que refleja la volatilidad de cerca de 41% de Tesla. La probabilidad neutral al riesgo de subir (`r round(call6$p, 4)`) es un poco mayor a 0.5 porque incorpora la tasa libre de riesgo.
+
+# 4. Árbol del call americano 385
+
+```{r arbol-call, fig.width = 11, fig.height = 6.5}
+graficar_arbol(n_vis,
+  function(i, j) paste0("S ", round(call6$precios[[i + 1]][j + 1], 1), "\nC ", round(call6$valores[[i + 1]][j + 1], 2)),
+  titulo = "Call americano TSLA 385 — 18-dic-2026 (6 pasos)",
+  subtitulo = paste0("S = precio de la acción, C = valor del call | precio con 6 pasos: US$", round(call6$precio, 2)))
+```
+
+**Interpretación:** El call vale US\$`r round(call6$precio, 2)` con 6 pasos. Ningún nodo está marcado para ejercicio anticipado: como Tesla no paga dividendo, siempre conviene más esperar (o vender el call) que ejercerlo, así que el call americano vale lo mismo que uno europeo.
+
+# 5. Árbol del put americano 385
+
+```{r arbol-put, fig.width = 11, fig.height = 6.5}
+graficar_arbol(n_vis,
+  function(i, j) paste0("S ", round(put6$precios[[i + 1]][j + 1], 1), "\nP ", round(put6$valores[[i + 1]][j + 1], 2)),
+  resaltar = function(i, j) put6$ejerce[[i + 1]][j + 1],
+  titulo = "Put americano TSLA 385 — 18-dic-2026 (6 pasos)",
+  subtitulo = paste0("S = precio de la acción, P = valor del put | en rojo: conviene ejercer antes | precio con 6 pasos: US$", round(put6$precio, 2)))
+
+nodos_ejercicio <- map_dfr(0:(n_vis - 1), function(i) tibble(Paso = i, Bajadas = 0:i,
+  `Precio TSLA` = put6$precios[[i + 1]], `Valor put` = put6$valores[[i + 1]], Ejerce = put6$ejerce[[i + 1]])) %>%
+  filter(Ejerce) %>% select(-Ejerce) %>%
+  mutate(`Día aprox.` = round(Paso * put6$dt * 365))
+kable(nodos_ejercicio, digits = 2, caption = "Nodos donde conviene ejercer el put antes del vencimiento") %>%
+  kable_styling(full_width = FALSE)
+```
+
+**Interpretación:** A diferencia del call, en el put sí aparecen nodos de ejercicio anticipado (en rojo). Son los nodos donde Tesla ya cayó bastante, o está abajo del strike y cerca del vencimiento. Ahí el put está dentro del dinero y le queda poco valor temporal, así que conviene ejercer, recibir los US\$385 y ganar intereses sobre ese dinero en lugar de esperar. Ese derecho es lo que hace que el put americano valga más que el europeo.
+
+# 6. Estrategia T2: valor del straddle en cada nodo
+
+El long straddle compra el call y el put. En cada nodo su valor es la suma de ambos; restando la prima pagada (mid de mercado) obtenemos la ganancia o pérdida si la posición se cerrara en ese nodo.
+
+```{r arbol-straddle, fig.width = 11, fig.height = 6.5}
+prima_straddle <- sum(mercado$mid)
+graficar_arbol(n_vis,
+  function(i, j) {
+    v <- call6$valores[[i + 1]][j + 1] + put6$valores[[i + 1]][j + 1]
+    paste0("S ", round(call6$precios[[i + 1]][j + 1], 1), "\nV ", round(v, 2), "\nP&L ", sprintf("%+.1f", v - prima_straddle))
+  },
+  resaltar = function(i, j) call6$valores[[i + 1]][j + 1] + put6$valores[[i + 1]][j + 1] > prima_straddle,
+  titulo = "Long straddle TSLA 385 (estrategia T2) — valor por nodo",
+  subtitulo = paste0("V = call + put; P&L por acción contra la prima pagada de US$", round(prima_straddle, 2),
+                     " | en rojo: nodos con ganancia"))
+```
+
+**Interpretación:** El straddle gana cuando Tesla se aleja del strike en cualquier dirección: los nodos en rojo están en los extremos del árbol, arriba y abajo. En los nodos del centro, donde Tesla se queda cerca de 385, la posición pierde valor conforme pasa el tiempo, porque el valor temporal de las dos opciones se va consumiendo. Ese es el costo de la theta negativa que vimos en la tarea de griegas.
+
+# 7. Valuación con 200 pasos y griegas
+
+```{r valuacion}
+n <- 200
+res <- list(
+  Call = list(am = arbol_binomial(S0, K, T, r, q, sigma, n, "call", TRUE),
+              eu = arbol_binomial(S0, K, T, r, q, sigma, n, "call", FALSE)),
+  Put  = list(am = arbol_binomial(S0, K, T, r, q, sigma, n, "put", TRUE),
+              eu = arbol_binomial(S0, K, T, r, q, sigma, n, "put", FALSE)))
+
+valuacion <- map_dfr(names(res), function(o) tibble(
+  Opción = o,
+  `Mid mercado` = mercado$mid[mercado$opcion == o],
+  `Árbol americana` = res[[o]]$am$precio,
+  `Árbol europea` = res[[o]]$eu$precio,
+  `Prima ejercicio anticipado` = res[[o]]$am$precio - res[[o]]$eu$precio,
+  Delta = res[[o]]$am$delta, Gamma = res[[o]]$am$gamma, `Theta (US$/día)` = res[[o]]$am$theta))
+valuacion <- bind_rows(valuacion,
+  valuacion %>% summarise(Opción = "Straddle T2", across(c(`Mid mercado`, `Árbol americana`, `Árbol europea`,
+    `Prima ejercicio anticipado`, Delta, Gamma, `Theta (US$/día)`), sum)))
+
+kable(valuacion, digits = 4, caption = paste("Valuación con", n, "pasos, por acción")) %>%
+  kable_styling()
+
+pos <- valuacion %>% filter(Opción == "Straddle T2")
+tibble(Medida = c("Costo de la posición (US$)", "Valor con el árbol (US$)", "Delta (acciones)", "Gamma US$ por 1%", "Theta (US$ por día)"),
+       Valor = c(pos$`Mid mercado` * 100 * contratos, pos$`Árbol americana` * 100 * contratos,
+                 pos$Delta * 100 * contratos, pos$Gamma * S0^2 / 100 * 100 * contratos, pos$`Theta (US$/día)` * 100 * contratos)) %>%
+  kable(digits = 1, format.args = list(big.mark = ","), caption = paste("Estrategia T2 con", contratos, "contratos por pata")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r convergencia, fig.width = 9, fig.height = 4.5}
+conv <- tibble(n = seq(4, 300, by = 4)) %>%
+  mutate(Call = map_dbl(n, ~ arbol_binomial(S0, K, T, r, q, sigma, .x, "call")$precio),
+         Put = map_dbl(n, ~ arbol_binomial(S0, K, T, r, q, sigma, .x, "put")$precio)) %>%
+  pivot_longer(-n, names_to = "Opción", values_to = "Precio")
+
+ggplot(conv, aes(n, Precio, color = Opción)) +
+  geom_line() +
+  geom_hline(data = mercado %>% rename(Opción = opcion), aes(yintercept = mid, color = Opción), linetype = "dotted") +
+  labs(title = "Convergencia del árbol (línea punteada = mid de mercado)", x = "Número de pasos", y = "Precio (US$)") +
+  theme_minimal()
+```
+
+**Interpretación:** Con 200 pasos el call vale US\$27.39 y el put US\$26.70, muy cerca del mid de mercado (US\$27.33 y US\$26.45). La gráfica de convergencia muestra que después de unos 50 pasos el precio ya casi no cambia. El call americano vale lo mismo que el europeo; el put americano vale US\$0.26 más por el derecho a ejercer antes, que es justo lo que vimos en los nodos rojos del árbol. Parte de la diferencia del put contra el mercado viene de que usamos la volatilidad promedio (40.9%), un poco más alta que la del put (40.5%).
+
+A nivel estrategia, el straddle tiene delta casi neutral (unas 38 acciones con 5 contratos), gamma positiva y theta de cerca de −US\$198 por día. Es decir, gana si Tesla se mueve mucho y pierde si el precio se queda quieto.
+
+# 8. Forecast del precio de Tesla al 18 de diciembre
+
+Las probabilidades de los nodos finales del árbol dan una distribución del precio de Tesla al vencimiento. Es una distribución neutral al riesgo (supone que la acción crece a la tasa libre de riesgo), así que sirve como pronóstico del rango de precios que descuenta el mercado de opciones, no como una predicción de rendimiento.
+
+```{r forecast, fig.width = 9, fig.height = 4.5}
+arbol_n <- res$Call$am
+dist <- tibble(bajadas = 0:n, precio = arbol_n$precios[[n + 1]]) %>%
+  mutate(prob = dbinom(n - bajadas, n, arbol_n$p))
+
+be_baja <- K - prima_straddle
+be_alza <- K + prima_straddle
+forecast <- tibble(
+  Medida = c("Precio esperado al vencimiento", "Percentil 5%", "Mediana", "Percentil 95%",
+             "Break-even inferior del straddle", "Break-even superior del straddle",
+             "Probabilidad de que el straddle gane al vencimiento"),
+  Valor = c(sum(dist$precio * dist$prob),
+            with(dist %>% arrange(precio), precio[which(cumsum(prob) >= 0.05)[1]]),
+            with(dist %>% arrange(precio), precio[which(cumsum(prob) >= 0.50)[1]]),
+            with(dist %>% arrange(precio), precio[which(cumsum(prob) >= 0.95)[1]]),
+            be_baja, be_alza,
+            sum(dist$prob[dist$precio < be_baja | dist$precio > be_alza])))
+kable(forecast %>% mutate(Valor = ifelse(row_number() == n(), scales::percent(Valor, 0.1), paste0("US$", round(Valor, 2)))),
+      caption = "Forecast neutral al riesgo del precio de TSLA al 18-dic-2026 (200 pasos)") %>%
+  kable_styling(full_width = FALSE)
+
+ggplot(dist %>% filter(prob > 1e-5), aes(precio, prob)) +
+  geom_col(aes(fill = precio < be_baja | precio > be_alza), width = 2) +
+  geom_vline(xintercept = c(be_baja, be_alza), linetype = "dashed") +
+  geom_vline(xintercept = S0, color = "grey40") +
+  scale_fill_manual(values = c(`TRUE` = "#2a7ab0", `FALSE` = "grey70"),
+                    labels = c(`TRUE` = "Straddle con ganancia", `FALSE` = "Straddle con pérdida"), name = NULL) +
+  labs(title = "Distribución del precio de TSLA al vencimiento según el árbol",
+       subtitle = "Líneas punteadas: break-evens del straddle | línea gris: precio actual",
+       x = "Precio de TSLA al 18-dic-2026 (US$)", y = "Probabilidad") +
+  theme_minimal() + theme(legend.position = "top")
+```
+
+**Interpretación:** Según el árbol, el precio esperado de Tesla al 18 de diciembre es US\$386, prácticamente el precio actual crecido a la tasa libre de riesgo. El rango es amplio: con 90% de probabilidad Tesla terminaría entre US\$284 y US\$504. Para que el straddle gane al vencimiento, Tesla tiene que terminar abajo de US\$331 o arriba de US\$439, y el árbol le da a eso una probabilidad de 43.7%. Esta es la apuesta de la estrategia: se paga una prima de US\$53.78 por acción esperando un movimiento grande, por ejemplo después del reporte de resultados.
+
+# 9. Evidencia de datos y operaciones
+
+Aquí están las capturas que respaldan los datos que usamos en el análisis y las operaciones que hicimos en los simuladores. Las imágenes están en la carpeta `capturas/`, junto a este archivo.
+
+## 9.1 Datos de Refinitiv (LSEG Workspace)
+
+![Precio de cierre de TSLA el 9 de octubre de 2026 (Refinitiv)](capturas/refinitiv_tsla_precio.png){width=100%}
+
+**Explicación:** Tesla cerró en US\$382.70 el 9 de octubre de 2026. Ese es el precio inicial de todos los árboles.
+
+![Cadena de calls de TSLA al 18-dic-2026 (Refinitiv)](capturas/refinitiv_tsla_calls_18dic.png){width=85%}
+
+**Explicación:** En la fila del strike 385 están los datos del call que usamos: bid de US\$27.10, ask de US\$27.55 y volatilidad implícita de 41.38%.
+
+![Cadena de puts de TSLA al 18-dic-2026 (Refinitiv)](capturas/refinitiv_tsla_puts_18dic.png){width=85%}
+
+**Explicación:** Para el put con strike 385: bid de US\$26.30, ask de US\$26.60 y volatilidad implícita de 40.48%. El promedio de las dos volatilidades (40.9%) es el que usamos para construir el árbol.
+
+## 9.2 TradingView: precio actual de Tesla y break-evens del straddle
+
+![Gráfica diaria de TSLA con el strike y los break-evens del straddle (TradingView)](capturas/tradingview_tsla_breakevens.png){width=100%}
+
+**Explicación:** La gráfica diaria muestra a Tesla en US\$372.22 (cierre del 23 de octubre). Marcamos tres líneas: el strike de 385 en el centro y los break-evens del straddle en US\$331 y US\$439. Hoy el precio está entre los dos break-evens, así que si la estrategia venciera hoy perdería dinero: Tesla necesita moverse cerca de 11% hacia arriba o hacia abajo antes del 18 de diciembre.
+
+Ese movimiento no es raro para Tesla. En la misma gráfica se ve que en el último año la acción rompió los dos niveles varias veces: subió a casi US\$500 a finales de 2025 y bajó a cerca de US\$300 a mediados de 2026. Eso respalda la idea del straddle, que gana cuando hay movimientos grandes, por ejemplo después de un reporte de resultados como el del 21 de octubre.
+
+## 9.3 CME: cobertura con un futuro del Nasdaq-100
+
+![Posición abierta en el simulador de CME: venta de 1 Micro E-mini Nasdaq-100 dic-26](capturas/cme_posicion_mnq.png){width=100%}
+
+**Explicación:** Vendimos 1 contrato del futuro Micro E-mini Nasdaq-100 con vencimiento en diciembre, a 29,200 puntos. Cada punto vale US\$2, así que la posición equivale a unos US\$58,400.
+
+La razón es la cobertura. Las cinco acciones del portafolio (AAPL, NVDA, TSLA, AMZN y META) forman parte del Nasdaq-100, así que si el sector tecnológico cae, el portafolio pierde pero la venta del futuro gana, y compensa parte de esa pérdida. Es una cobertura parcial: el portafolio completo tiene una exposición mayor, pero con un contrato se ve cómo funciona la idea. El straddle de Tesla por sí solo casi no necesita cobertura, porque su delta es cercana a cero (sección 7).
+
+```{r evidencia-investopedia, echo = FALSE, results = "asis"}
+# Las capturas de Investopedia se agregan solas cuando están en la carpeta capturas/
+investopedia <- tribble(
+  ~archivo,                                       ~titulo,
+  "capturas/investopedia_1_orden_call.png",      "Compra del call TSLA 385, vencimiento 18-dic-2026",
+  "capturas/investopedia_2_orden_put.png",       "Compra del put TSLA 385, vencimiento 18-dic-2026",
+  "capturas/investopedia_3_portafolio.png",      "Portafolio con las posiciones abiertas y su asignación",
+  "capturas/investopedia_4_historial.png",       "Historial de órdenes ejecutadas"
+) %>% filter(file.exists(archivo))
+
+if (nrow(investopedia) > 0) {
+  cat("## 9.4 Investopedia: operación de la estrategia T2\n\n")
+  cat("En el simulador de Investopedia compramos el call y el put de Tesla con strike de US\\$385 y vencimiento el 18 de diciembre, ",
+      "que son las dos patas del straddle que analizamos con el árbol. Usamos órdenes límite cerca del precio medio para no pagar de más.\n\n")
+  for (i in seq_len(nrow(investopedia))) {
+    cat("![", investopedia$titulo[i], "](", investopedia$archivo[i], "){width=100%}\n\n", sep = "")
+  }
+  cat("**Explicación:** Con estas dos compras queda armado el straddle. La pantalla del portafolio muestra cuánto del dinero de la cuenta quedó en cada posición (la asignación). ",
+      "Si Tesla se mueve mucho en cualquier dirección antes del vencimiento, la posición gana; si se queda cerca de US\\$385, pierde poco a poco por el paso del tiempo.\n\n")
+}
+```
+
+# Conclusiones
+
+Construimos árboles binomiales para el call y el put americanos de Tesla con strike de US\$385 y vencimiento a 68 días, que forman la estrategia T2 de nuestro portafolio. Con 6 pasos se ve cómo se mueve el precio y en qué nodos conviene ejercer, el call nunca se ejerce antes porque Tesla no paga dividendo, mientras que el put sí se ejerce en los nodos donde la acción cae mucho. Con 200 pasos el árbol queda muy cerca de los precios de mercado. Además, las probabilidades de los nodos finales nos dan un forecast del precio de Tesla y de la probabilidad de que la estrategia gane al vencimiento (43.7%). El mismo código se puede aplicar a las demás acciones del portafolio cambiando el spot, el strike, el vencimiento y la volatilidad en la sección 1.
