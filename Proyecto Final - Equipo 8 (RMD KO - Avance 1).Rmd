@@ -1,0 +1,394 @@
+---
+title: "Coca-Cola (KO): ¿le conviene emitir un bono convertible?"
+subtitle: "Productos Derivados — Avance 1 del proyecto final"
+author: "Equipo 8: Maria Cecilia Cantú, Melissa Arizoca, Valeria Acosta"
+date: "Datos de LSEG Workspace al 25 de octubre de 2026"
+lang: es
+output:
+  html_document:
+    theme: flatly
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 4.5)
+
+# Librerías (instalar una sola vez con install.packages() si faltan)
+library(tidyverse)   # manejo de datos y gráficas
+library(readxl)      # leer los archivos exportados de LSEG
+library(plotly)      # gráficas interactivas
+library(DT)          # tablas interactivas
+library(htmltools)   # tarjetas de indicadores
+
+# Tarjeta de indicador para el tablero
+tarjeta <- function(valor, etiqueta, nota = NULL, color = "#1F3B5C") {
+  sin_dolar <- function(x) HTML(gsub("$", "&#36;", x, fixed = TRUE))   # evita que el signo de pesos se lea como fórmula
+  valor <- sin_dolar(valor); etiqueta <- sin_dolar(etiqueta); if (!is.null(nota)) nota <- sin_dolar(nota)
+  div(style = paste0("display:inline-block; width:31%; min-width:180px; margin:0 1% 12px 0; padding:12px 14px;",
+                     "border-left:5px solid ", color, "; background:#f6f8fa; border-radius:6px; vertical-align:top;"),
+      div(style = "font-size:24px; font-weight:700; color:#1F3B5C;", valor),
+      div(style = "font-size:13px; color:#333;", etiqueta),
+      if (!is.null(nota)) div(style = "font-size:11px; color:#777; margin-top:2px;", nota))
+}
+fila <- function(...) div(style = "margin:8px 0 6px 0;", ...)
+usd <- function(x, d = 1) paste0("US$", formatC(x, format = "f", digits = d, big.mark = ","))
+pct <- function(x, d = 2) paste0(formatC(100 * x, format = "f", digits = d), "%")
+```
+
+<style>
+.tab-content { padding-top: 12px; }
+h2 { font-size: 22px; }
+.nav-pills > li > a { font-weight: 600; }
+</style>
+
+**Situación problema.** En 2007 Deutsche Bank estructuró para Molson Coors un bono convertible de US\$575 millones a 6 años, con prima de conversión de 25% y cupón de 2.5%, para recomprar bonos caros de 6.38%. Además, Molson compró una cobertura (*call spread*) que llevó la prima efectiva a 60%. En este proyecto aplicamos la misma lógica a **Coca-Cola (KO)**: ¿le conviene financiarse con un convertible en lugar de deuda tradicional?, ¿con qué prima y qué cupón?, ¿y cuánto costaría una cobertura como la de Molson?
+
+Este avance reúne los datos de LSEG que vamos a usar (empresa, deuda, calificación y tasas) y un primer cálculo del convertible.
+
+# {.tabset .tabset-pills}
+
+## 1. Resumen de la empresa
+
+```{r datos-mercado}
+# ---- Datos de la pantalla Overview y FOV de LSEG (25-oct-2026; precio al cierre del 23-oct) ----
+precio      <- 92.71
+market_cap  <- 398.889      # miles de millones de USD
+acciones    <- 4.30         # miles de millones
+div_yield   <- 0.0229
+beta        <- 0.29
+pe_ltm      <- 27.93
+cds_5y      <- 35.60        # puntos base
+
+# ---- Precio histórico diario (exportado de LSEG: Price & Charts > Price History, 2 años) ----
+ph <- read_excel("datos/KO_price_history.xlsx", col_names = FALSE)
+inicio <- which(ph[[1]] == "Exchange Date")
+precios <- ph[(inicio + 1):nrow(ph), 1:2] %>%
+  setNames(c("fecha", "cierre")) %>%
+  mutate(fecha = as.Date(as.numeric(fecha), origin = "1899-12-30"), cierre = as.numeric(cierre)) %>%
+  filter(!is.na(fecha), !is.na(cierre)) %>%
+  arrange(fecha) %>%
+  mutate(rend = log(cierre / lag(cierre)))
+
+vol_1a <- sd(tail(precios$rend, 252), na.rm = TRUE) * sqrt(252)
+vol_2a <- sd(precios$rend, na.rm = TRUE) * sqrt(252)
+```
+
+```{r tarjetas-resumen, echo = FALSE}
+fila(
+  tarjeta(usd(precio, 2), "Precio de la acción", "Cierre del 23-oct-2026"),
+  tarjeta(paste0(usd(market_cap, 1), " mil M"), "Valor de mercado", paste0(acciones, " mil millones de acciones")),
+  tarjeta(pct(div_yield), "Rendimiento por dividendo", "Clave para valuar la opción"),
+  tarjeta(pct(vol_1a, 1), "Volatilidad histórica (1 año)", paste0("2 años: ", pct(vol_2a, 1))),
+  tarjeta(beta, "Beta (5 años)", "Se mueve mucho menos que el mercado"),
+  tarjeta(pe_ltm, "Precio / utilidad (P/E)", "Últimos 12 meses")
+)
+```
+
+```{r grafica-precio}
+plot_ly(precios, x = ~fecha, y = ~cierre, type = "scatter", mode = "lines",
+        line = list(color = "#C8102E"), hovertemplate = "%{x}<br>US$%{y:.2f}<extra></extra>") %>%
+  layout(title = list(text = "Precio de KO — últimos 2 años (LSEG)", font = list(size = 15)),
+         xaxis = list(title = ""), yaxis = list(title = "USD por acción"))
+```
+
+```{r tabla-financieros}
+# Resumen financiero de la pantalla FOV (miles de millones de USD); FY2026 es el pronóstico promedio de analistas (I/B/E/S)
+financieros <- tribble(
+  ~Concepto,            ~`FY2024`, ~`FY2025`, ~`Últimos 12 meses`, ~`FY2026 (pronóstico)`,
+  "Ventas",              46.90,     48.06,     50.07,               49.80,
+  "EBITDA",              15.16,     16.06,     16.94,               17.39,
+  "Margen EBITDA (%)",   32.33,     33.42,     33.82,               34.92,
+  "Utilidad neta",       12.46,     12.96,     13.94,               14.26,
+  "Margen neto (%)",     26.58,     26.96,     27.84,               28.63,
+  "Utilidad por acción", 2.88,      3.00,      3.23,                3.31
+)
+datatable(financieros, rownames = FALSE, options = list(dom = "t", ordering = FALSE),
+          caption = "Resumen financiero de KO (miles de millones de USD, salvo márgenes y utilidad por acción). Fuente: LSEG, pantalla FOV.") %>%
+  formatRound(2:5, 2)
+```
+
+**Lectura.** Coca-Cola es una empresa grande, estable y muy rentable: vende cerca de US\$50 mil millones al año con un margen neto de 28%. Su acción se mueve poco comparada con el mercado (beta de 0.29) y tiene una volatilidad de `r pct(vol_1a, 1)`, baja para una acción. En lo que va del año subió 33% y está cerca de su máximo de 52 semanas. Dos datos son clave para el convertible: la volatilidad baja y el dividendo de `r pct(div_yield)`. Los dos hacen que la opción de conversión valga menos que en el caso de Molson.
+
+## 2. Deuda
+
+```{r datos-deuda}
+# ---- Pantalla FOV (millones de USD) ----
+deuda_total <- 43543; caja <- 12907; inversiones_cp <- 3464
+deuda_ebitda <- 2.83; ebitda_intereses <- 9.72; deuda_capital <- 1.2045
+deuda_neta <- deuda_total - caja - inversiones_cp
+
+# ---- Lista de bonos (LSEG: Debt & Credit > Debt Structure, exportado) ----
+bonos <- read_excel("datos/KO_bonos.xlsx", sheet = "Bonds", skip = 1) %>%
+  transmute(Bono = str_trim(Description),
+            Vencimiento = if (is.numeric(`Maturity Date`)) as.Date(`Maturity Date`, origin = "1899-12-30") else as.Date(`Maturity Date`),
+            Monto_MM = `Amount Outstanding` / 1e6, Cupon = Coupon, Moneda = Currency,
+            Tipo = `Instrument Type`, Precio = `Last Price`, Rendimiento = Yield) %>%
+  filter(Monto_MM > 0)
+```
+
+```{r tarjetas-deuda, echo = FALSE}
+fila(
+  tarjeta(paste0(usd(deuda_total / 1000, 1), " mil M"), "Deuda total"),
+  tarjeta(paste0(usd((caja + inversiones_cp) / 1000, 1), " mil M"), "Caja e inversiones de corto plazo"),
+  tarjeta(paste0(usd(deuda_neta / 1000, 1), " mil M"), "Deuda neta"),
+  tarjeta(paste0(deuda_ebitda, "x"), "Deuda / EBITDA (FY2025)", "Años de EBITDA para pagar la deuda"),
+  tarjeta(paste0(ebitda_intereses, "x"), "EBITDA / intereses (FY2025)", "Veces que el EBITDA cubre los intereses"),
+  tarjeta(paste0(nrow(bonos), " bonos"), "Emisiones vigentes", paste0(usd(sum(bonos$Monto_MM) / 1000, 1), " mil M en circulación"))
+)
+```
+
+```{r perfil-vencimientos}
+perfil <- bonos %>%
+  mutate(Año = year(Vencimiento),
+         Moneda = case_when(str_detect(Moneda, "US") ~ "Dólares", str_detect(Moneda, "Euro") ~ "Euros", TRUE ~ "Francos suizos")) %>%
+  filter(Año <= 2041) %>%
+  group_by(Año, Moneda) %>% summarise(Monto = sum(Monto_MM), .groups = "drop")
+
+plot_ly(perfil, x = ~Año, y = ~Monto, color = ~Moneda, colors = c("#1F3B5C", "#C8102E", "#9aa5b1"), type = "bar",
+        hovertemplate = "%{x}: US$%{y:,.0f} M<extra></extra>") %>%
+  layout(barmode = "stack", title = list(text = "Perfil de vencimientos de los bonos de KO (millones de USD)", font = list(size = 15)),
+         xaxis = list(title = "", dtick = 1), yaxis = list(title = "Millones de USD"),
+         annotations = list(list(x = 2027, y = 4900, text = "US$3,000 M en dólares<br>vencen en 2027", showarrow = TRUE, ay = -40)))
+```
+
+```{r tabla-bonos}
+datatable(bonos %>% arrange(Vencimiento) %>% mutate(Vencimiento = format(Vencimiento, "%d-%b-%Y")),
+          rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE),
+          colnames = c("Bono", "Vencimiento", "Monto (MM)", "Cupón (%)", "Moneda", "Tipo", "Precio", "Rendimiento (%)"),
+          caption = "Bonos vigentes de Coca-Cola (LSEG). Los montos están en millones de la moneda del bono.") %>%
+  formatRound(c("Monto_MM"), 0) %>% formatRound(c("Precio", "Rendimiento"), 2)
+```
+
+**Lectura.** KO tiene una deuda manejable: equivale a 2.8 años de EBITDA y su EBITDA cubre casi 10 veces los intereses. Su deuda está repartida en `r nrow(bonos)` bonos en dólares, euros y francos suizos, con vencimientos que llegan hasta 2098.
+
+**Uso de los fondos (equivalente al *tender* de Molson).** En 2027 vencen **tres bonos en dólares por US\$3,000 millones**: 3.375% (marzo), 2.900% (mayo) y 1.450% (junio). Esa deuda se contrató cuando las tasas eran bajas, y para refinanciarla hoy con un bono tradicional a 6 años KO pagaría alrededor de 5.1%. Proponemos que el convertible financie justamente ese refinanciamiento: emitir **US\$3,000 millones** y recomprar esos bonos a precio de mercado (entre 98 y 99.6 por cada 100), como Molson hizo con sus bonos de 6.38%.
+
+## 3. Calificación y tasas
+
+```{r calificaciones}
+calif <- read_excel("datos/KO_calificaciones.xlsx", skip = 4) %>%
+  select(Tipo = 1, Calificación = 2, Fecha = 3, Perspectiva = 6) %>%
+  filter(!is.na(Tipo), str_detect(Tipo, "\\(Foreign\\)"),
+         str_detect(Tipo, "S&P Long-term Issuer|S&P Senior Unsecured|Moody's Senior Unsecured|Moody's Derived Long-term|Fitch Long-term Issuer Default")) %>%
+  mutate(Agencia = str_extract(Tipo, "S&P|Moody's|Fitch"),
+         Tipo = str_remove_all(Tipo, "S&P |Moody's |Fitch | \\[.*\\]| \\(Foreign\\)"),
+         Perspectiva = recode(Perspectiva, "STABLE" = "Estable", "STA" = "Estable", "--" = "—")) %>%
+  select(Agencia, Tipo, Calificación, Fecha, Perspectiva)
+
+datatable(calif, rownames = FALSE, options = list(dom = "t", pageLength = 20, ordering = FALSE),
+          caption = "Calificaciones de Coca-Cola (LSEG, Issuer Ratings). WD = calificación retirada por la agencia.")
+```
+
+```{r tasas}
+# ---- Treasuries (LSEG: US5YT=RR y US7YT=RR, rendimiento ask al 25-oct-2026) ----
+tesoro <- tibble(Plazo = c(5, 7), Bono = c("UST 5.000% 30-sep-2031", "UST 5.000% 30-sep-2033"),
+                 Rendimiento = c(4.7852, 4.8692))
+r_6a <- mean(tesoro$Rendimiento) / 100            # tasa libre de riesgo a 6 años (promedio de 5 y 7)
+
+# ---- Rendimiento de los bonos de KO en dólares (tasa de descuento del bono simple) ----
+ko_usd <- bonos %>% filter(str_detect(Moneda, "US"), Tipo == "Note", Vencimiento < as.Date("2041-01-01")) %>%
+  mutate(Plazo = as.numeric(Vencimiento - as.Date("2026-10-25")) / 365.25)
+y_6a <- ko_usd %>% filter(between(Plazo, 4.3, 5.3)) %>% summarise(mean(Rendimiento)) %>% pull() / 100
+spread_pb <- (y_6a - r_6a) * 10000
+```
+
+```{r tarjetas-tasas, echo = FALSE}
+fila(
+  tarjeta("A+ / A1", "Calificación S&P / Moody's", "Perspectiva estable en ambas"),
+  tarjeta(paste0(cds_5y, " pb"), "CDS a 5 años", "Costo de asegurarse contra un impago de KO"),
+  tarjeta(pct(r_6a), "Tasa libre de riesgo a 6 años", "Promedio de Treasuries a 5 y 7 años"),
+  tarjeta(pct(y_6a), "Tasa de un bono simple de KO a ~6 años", "Promedio de sus bonos 2031–2032"),
+  tarjeta(paste0(round(spread_pb), " pb"), "Spread sobre el Tesoro", "Lo que el mercado cobra extra por prestarle a KO")
+)
+```
+
+```{r curva}
+plot_ly() %>%
+  add_markers(data = ko_usd, x = ~Plazo, y = ~Rendimiento, name = "Bonos de KO en USD",
+              marker = list(color = "#C8102E", size = 9), text = ~Bono, hovertemplate = "%{text}<br>%{y:.2f}%<extra></extra>") %>%
+  add_trace(data = tesoro, x = ~Plazo, y = ~Rendimiento, name = "Bonos del Tesoro", type = "scatter", mode = "markers+lines",
+            marker = list(color = "#1F3B5C", size = 10, symbol = "diamond"), line = list(color = "#1F3B5C")) %>%
+  layout(title = list(text = "Rendimiento de los bonos de KO vs. bonos del Tesoro de EE. UU.", font = list(size = 15)),
+         xaxis = list(title = "Años al vencimiento"), yaxis = list(title = "Rendimiento (%)"))
+```
+
+**Lectura.** Coca-Cola tiene calificación A+ (S&P) y A1 (Moody's), ambas con perspectiva estable, y su CDS de 36 puntos base indica que el mercado ve muy poco riesgo de impago. Por eso puede pedir prestado a solo `r round(spread_pb)` puntos base por arriba del gobierno de EE. UU. Para el convertible usamos dos tasas: **`r pct(r_6a)`** como tasa libre de riesgo (para valuar la opción) y **`r pct(y_6a)`** como tasa de descuento del bono simple (el equivalente al 5.75% del caso Molson).
+
+## 4. Convertible
+
+```{r supuestos-convertible}
+# ---- Supuestos (cambiar aquí para hacer escenarios) ----
+S       <- precio         # precio de KO
+q       <- div_yield      # rendimiento por dividendo
+sigma   <- vol_1a         # volatilidad histórica de 1 año
+r       <- r_6a           # tasa libre de riesgo a 6 años
+y_bono  <- y_6a           # tasa de descuento del bono simple de KO
+T       <- 6              # años al vencimiento, igual que Molson
+prima   <- 0.25           # prima de conversión propuesta
+emision <- 3000           # millones de USD
+
+# Black-Scholes para un call europeo con dividendo continuo
+bs_call <- function(S, K, T, r, q, sigma) {
+  d1 <- (log(S / K) + (r - q + sigma^2 / 2) * T) / (sigma * sqrt(T)); d2 <- d1 - sigma * sqrt(T)
+  S * exp(-q * T) * pnorm(d1) - K * exp(-r * T) * pnorm(d2)
+}
+# Valor de un bono de 1,000 con cupón semestral
+valor_bono <- function(cupon, y, T = 6) {
+  n <- T * 2; i <- y / 2
+  sum(1000 * cupon / 2 / (1 + i)^(1:n)) + 1000 / (1 + i)^n
+}
+# Cupón que hace que el convertible valga exactamente 1,000
+cupon_equilibrio <- function(valor_opcion_bono, y) uniroot(function(c) valor_bono(c, y) - (1000 - valor_opcion_bono), c(-0.1, 0.2))$root
+
+valuar <- function(prima, q = div_yield, sigma = vol_1a) {
+  K <- S * (1 + prima); acciones_bono <- 1000 / K
+  opcion <- bs_call(S, K, T, r, q, sigma) * acciones_bono
+  cupon <- cupon_equilibrio(opcion, y_bono)
+  tibble(prima, K, acciones_bono, opcion, bono = 1000 - opcion, cupon)
+}
+
+base <- valuar(prima)
+sin_div <- valuar(prima, q = 0)
+ahorro_anual <- (y_bono - base$cupon) * emision
+```
+
+```{r tarjetas-convertible, echo = FALSE}
+fila(
+  tarjeta(usd(base$K, 2), "Precio de conversión", paste0("Prima de ", pct(prima, 0), " sobre US$", precio)),
+  tarjeta(round(base$acciones_bono, 2), "Acciones por cada bono de US$1,000"),
+  tarjeta(usd(base$opcion, 1), "Valor de la opción por bono", "Black-Scholes con dividendo"),
+  tarjeta(usd(base$bono, 1), "Valor del bono simple", paste0("Descontado al ", pct(y_bono))),
+  tarjeta(pct(base$cupon), "Cupón del convertible", paste0("vs. ", pct(y_bono), " de un bono tradicional"), color = "#C8102E"),
+  tarjeta(paste0(usd(ahorro_anual, 0), " M"), "Ahorro de intereses al año", paste0("Sobre US$", formatC(emision, big.mark = ","), " M"), color = "#C8102E")
+)
+```
+
+**Cómo se calcula.** Igual que en el caso Molson, el convertible se separa en dos piezas: un **bono simple** más una **opción call** sobre las acciones de KO. Con una prima de 25%, el inversionista puede cambiar su bono por acciones a US\$`r round(base$K, 2)`, es decir, `r round(base$acciones_bono, 2)` acciones por cada bono de US\$1,000. Valuamos la opción con Black-Scholes (US\$`r round(base$opcion, 1)` por bono) y buscamos el cupón con el que el bono simple vale lo que falta para llegar a US\$1,000: **`r pct(base$cupon)`**.
+
+```{r comparacion-molson}
+molson <- tibble(Concepto = c("Precio de la acción", "Prima de conversión", "Volatilidad", "Dividendo", "Tasa libre de riesgo", "Tasa del bono simple",
+                              "Valor de la opción por bono", "Valor del bono simple", "Cupón del convertible"),
+                 `Molson (2007)` = c("US$87.61", "25%", "23%", "No se considera", "4.46%", "5.75%", "US$191.5", "US$808.5", "1.93%"),
+                 `KO con dividendo` = c(usd(S, 2), pct(prima, 0), pct(sigma, 1), pct(q), pct(r), pct(y_bono),
+                                        usd(base$opcion, 1), usd(base$bono, 1), pct(base$cupon)),
+                 `KO sin dividendo` = c(usd(S, 2), pct(prima, 0), pct(sigma, 1), "0%", pct(r), pct(y_bono),
+                                        usd(sin_div$opcion, 1), usd(sin_div$bono, 1), pct(sin_div$cupon)))
+datatable(molson, rownames = FALSE, options = list(dom = "t", ordering = FALSE, pageLength = 20),
+          caption = "Mismo cálculo que el caso Molson, aplicado a KO")
+```
+
+```{r curva-prima}
+curva <- map_dfr(seq(0.10, 0.80, by = 0.05), function(p) bind_rows(
+  valuar(p) %>% mutate(Escenario = "KO con dividendo"),
+  valuar(p, q = 0) %>% mutate(Escenario = "KO sin dividendo (modelo del caso)")))
+
+plot_ly(curva, x = ~prima * 100, y = ~cupon * 100, color = ~Escenario, colors = c("#C8102E", "#9aa5b1"),
+        type = "scatter", mode = "lines+markers", hovertemplate = "Prima %{x:.0f}%: cupón %{y:.2f}%<extra></extra>") %>%
+  add_lines(x = c(10, 80), y = rep(y_bono * 100, 2), name = "Bono tradicional de KO", inherit = FALSE,
+            line = list(color = "#1F3B5C", dash = "dash")) %>%
+  layout(title = list(text = "Cupón del convertible según la prima de conversión", font = list(size = 15)),
+         xaxis = list(title = "Prima de conversión (%)"), yaxis = list(title = "Cupón (%)"))
+```
+
+```{r sensibilidad}
+sens <- expand_grid(Volatilidad = c(0.17, vol_1a, 0.21, 0.23), Prima = c(0.15, 0.25, 0.40, 0.60)) %>%
+  mutate(Cupon = map2_dbl(Prima, Volatilidad, ~ valuar(.x, sigma = .y)$cupon)) %>%
+  mutate(Volatilidad = pct(Volatilidad, 1), Prima = paste("Prima", pct(Prima, 0))) %>%
+  pivot_wider(names_from = Prima, values_from = Cupon)
+datatable(sens, rownames = FALSE, options = list(dom = "t", ordering = FALSE),
+          caption = "Cupón del convertible por volatilidad y prima (con dividendo)") %>%
+  formatPercentage(2:5, 2)
+```
+
+**Lectura.**
+
+* **El dividendo cambia mucho el resultado.** Como el dueño del convertible no recibe dividendos mientras no convierta, la opción vale menos: US\$`r round(base$opcion, 1)` por bono con dividendo contra US\$`r round(sin_div$opcion, 1)` sin él. Por eso el cupón de equilibrio sube de `r pct(sin_div$cupon)` a `r pct(base$cupon)`. Si usáramos el modelo del caso Molson, que no toma en cuenta el dividendo, propondríamos un cupón demasiado bajo y el bono no se vendería a su valor.
+* **Aun así, KO ahorra.** Con prima de 25% y cupón de `r pct(base$cupon)`, KO pagaría `r round((y_bono - base$cupon) * 10000)` puntos base menos que con un bono tradicional: unos **US\$`r round(ahorro_anual)` millones al año** sobre US\$3,000 millones.
+* **Entre más alta la prima, menor el ahorro.** Con prima de 60% el cupón sube a `r pct(valuar(0.60)$cupon)`, cerca del costo de la deuda tradicional.
+* **Dilución pequeña.** Si todos convirtieran, KO emitiría unos `r round(emision / base$K, 1)` millones de acciones nuevas, apenas `r pct(emision / base$K / (acciones * 1000))` de las acciones actuales.
+
+## 5. Cobertura (call spread)
+
+```{r call-spread}
+K1 <- S * 1.25; K2 <- S * 1.60
+acciones_conv <- emision / K1                                  # millones de acciones del convertible
+costo_cobertura <- bs_call(S, K1, T, r, q, sigma) * acciones_conv
+ingreso_warrants <- bs_call(S, K2, T, r, q, sigma) * acciones_conv
+neto <- ingreso_warrants - costo_cobertura
+
+spread <- tibble(
+  Concepto = c("Compra de calls a 125% (cobertura del convertible)", "Venta de warrants a 160%", "Costo neto", "Costo neto como % de la emisión"),
+  `KO (millones USD)` = c(-costo_cobertura, ingreso_warrants, neto, NA),
+  `KO (% de la emisión)` = c(-costo_cobertura, ingreso_warrants, neto, neto) / emision,
+  `Molson (% de la emisión)` = c(-0.186, 0.099, -0.086, -0.086))
+datatable(spread[1:3, ], rownames = FALSE, options = list(dom = "t", ordering = FALSE),
+          caption = paste0("Call spread de 25% a 60% sobre ", round(acciones_conv, 1), " millones de acciones")) %>%
+  formatRound(2, 1) %>% formatPercentage(3:4, 1)
+```
+
+**Cómo funciona.** Como en el caso Molson, KO puede subir su prima efectiva de 25% a 60% sin cambiar el bono. Para eso **compra calls** con precio de ejercicio de US\$`r round(K1, 2)` (125%), que la cubren si los inversionistas convierten, y **vende warrants** a US\$`r round(K2, 2)` (160%). El efecto combinado es que KO solo entrega acciones nuevas si la acción supera US\$`r round(K2, 2)`.
+
+**Lectura.** No hay almuerzo gratis: la cobertura cuesta US\$`r round(costo_cobertura)` millones y los warrants solo recuperan US\$`r round(ingreso_warrants)` millones. El costo neto es de **US\$`r round(-neto)` millones (`r pct(-neto / emision, 1)` de la emisión)**, menor que el 8.6% de Molson porque las opciones de KO valen menos (menor volatilidad y dividendo). Contra el ahorro de US\$`r round(ahorro_anual)` millones al año en intereses, la cobertura se pagaría en unos `r round(-neto / ahorro_anual, 1)` años.
+
+## 6. Competidores
+
+```{r competidores}
+comp <- read_excel("datos/KO_competidores.xlsx") %>%
+  transmute(Empresa = `Company Name`, RIC = `Identifier (RIC)`,
+            `Valor de mercado (mil M USD)` = `Market Cap\n(USD)` / 1e9,
+            `P/E` = `P/E(Time Series Ratio)`,
+            `Precio / valor en libros` = `Price To Book Value Per Share(Time Series Ratio)`,
+            `ROE (%)` = 100 * `Return on Average Common Equity - %, TTM\n(FI0)`,
+            `Margen neto (%)` = 100 * `Income after Tax Margin - %\n(FY0)`,
+            `Deuda / capital (veces)` = `Total Debt Percentage of Total Equity\n(FY0)`,
+            Beta = `Beta 5 Year`)
+datatable(comp, rownames = FALSE, options = list(dom = "t", ordering = TRUE),
+          caption = "Comparación con empresas de bebidas y consumo (LSEG, Peers & Valuation)") %>%
+  formatRound(3:9, 2)
+
+plot_ly(comp, x = ~`Margen neto (%)`, y = ~`P/E`, text = ~Empresa,
+        type = "scatter", mode = "markers+text", textposition = "top center", textfont = list(size = 11),
+        marker = list(color = ifelse(comp$RIC == "KO.N", "#C8102E", "#1F3B5C"), opacity = 0.7,
+                      size = 12 + 40 * sqrt(comp$`Valor de mercado (mil M USD)` / max(comp$`Valor de mercado (mil M USD)`))),
+        hovertemplate = "%{text}<br>Margen neto %{x:.1f}%<br>P/E %{y:.1f}<extra></extra>") %>%
+  layout(title = list(text = "Rentabilidad vs. valuación (el tamaño es el valor de mercado)", font = list(size = 15)),
+         xaxis = list(title = "Margen neto (%)"), yaxis = list(title = "P/E"))
+```
+
+**Lectura.** KO es la empresa más grande del grupo y la de mayor margen (27% de utilidad neta sobre ventas, contra 9% de PepsiCo), y el mercado le paga una valuación alta por eso (P/E de 28). También es de las menos volátiles (beta de 0.29). Esto apoya la idea del convertible: los inversionistas aceptan un cupón bajo a cambio de participar en la subida de una acción de alta calidad, mientras que KO financia su deuda más barata.
+
+## 7. Conclusiones preliminares
+
+Respuestas preliminares a las preguntas del caso, aplicadas a Coca-Cola:
+
+1. **Uso de fondos.** Refinanciar los US\$3,000 millones de bonos en dólares que vencen en 2027, recomprándolos a precio de mercado, igual que Molson hizo con sus bonos de 6.38%.
+2. **Convertible vs. deuda o acciones.** Para KO, la ventaja principal es pagar un cupón cerca de 2 puntos porcentuales menor que un bono tradicional. La desventaja es la posible dilución, que en este caso es muy pequeña (`r pct(emision / base$K / (acciones * 1000))` de las acciones).
+3. **Bono + opción.** Con prima de 25%, cada bono de US\$1,000 vale US\$`r round(base$bono, 1)` como bono simple más US\$`r round(base$opcion, 1)` como opción.
+4. **¿Nos gusta como CEO?** Sí, pero con cuidado en dos cosas: el modelo debe incluir el dividendo (si no, el cupón queda demasiado bajo) y la prima de 25% puede ser baja para una acción que subió 32% en el año.
+5. **Prima de 60%.** Se logra con el call spread: comprar calls a 125% y vender warrants a 160%.
+6. **Cupón de equilibrio.** `r pct(base$cupon)` con prima de 25%, volatilidad de `r pct(sigma, 1)` y tasa de descuento de `r pct(y_bono)`.
+7. **Costo de la cobertura.** Costo neto de US\$`r round(-neto)` millones (`r pct(-neto / emision, 1)` de la emisión), que se recupera en unos `r round(-neto / ahorro_anual, 1)` años de ahorro en intereses.
+
+**Siguientes pasos:** usar la volatilidad implícita de opciones de largo plazo de KO (LEAPS) en lugar de la histórica, revisar el impacto del reporte de resultados del 27 de octubre y comparar contra convertibles recientes de empresas con calificación similar.
+
+## 8. Evidencia (LSEG)
+
+Capturas de LSEG Workspace del 25 de octubre de 2026. Los archivos exportados (Excel y PDF) están en la carpeta `datos/`, y el código de este documento los lee directamente.
+
+![Pantalla Overview de KO.N: precio, valor de mercado, dividendo, beta y CDS](capturas/lseg_ko_overview.png){width=100%}
+
+![Precio diario de KO.N a 2 años (Price & Charts)](capturas/lseg_ko_precio_2y.png){width=100%}
+
+![Bono del Tesoro a 5 años (US5YT=RR): rendimiento de 4.785%](capturas/lseg_ust_5y.png){width=100%}
+
+![Bono del Tesoro a 7 años (US7YT=RR): rendimiento de 4.869%](capturas/lseg_ust_7y.png){width=100%}
+
+| Archivo en `datos/` | Pantalla de LSEG | Se usa en |
+|---|---|---|
+| KO_price_history.xlsx | Price & Charts → Price History (2 años, diario) | Gráfica de precio y volatilidad |
+| KO_FOV.pdf | KO.N FOV | Indicadores financieros y de deuda |
+| KO_estados_financieros.xlsx | Financials (Income Statement, Balance Sheet, Cash Flow) | Respaldo de los indicadores |
+| KO_bonos.xlsx | Debt & Credit → Debt Structure | Perfil de vencimientos, tasa del bono simple |
+| KO_calificaciones.xlsx | Debt & Credit → Issuer Ratings | Calificación crediticia |
+| KO_competidores.xlsx | Peers & Valuation | Comparación con competidores |
