@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coca-Cola: Bono Convertible</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<style>
+:root {
+  color-scheme: light;
+  --font-anthropic-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-anthropic-serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --color-bg: #faf9f5; --color-panel: #ffffff; --color-fg: #1f1e1d; --color-fg-muted: #6b6a66;
+  --color-border-line: #e6e3da; --color-ok: #2f7d4f; --color-warn: #a86b12; --color-bad: #c0392b;
+  --cds-text-secondary: #6b6a66; --cds-surface-popover: #ffffff; --cds-border: #e0ddd3;
+  --cds-shadow-popover: 0 4px 16px rgba(0,0,0,.10);
+  --cds-chart-muted: #cfccc2; --cds-chart-grid: #ece9e1; --cds-chart-axis: #8f8c84; --cds-chart-reference: #8f8c84;
+  --kc-s0: #c96442; --kc-s1: #3b6fb6; --kc-s2: #7a8f3a;
+  --cds-font-size-caption: 12px; --cds-font-size-body: 14px; --cds-font-size-heading: 16px; --cds-font-size-title: 28px;
+  --cds-font-weight-medium: 500; --cds-radius: 10px;
+  --cds-gap-xs: 4px; --cds-gap-sm: 8px; --cds-gap-md: 16px; --cds-gap-lg: 24px; --cds-gap-xl: 36px;
+  --cds-pad-xs: 4px; --cds-pad-sm: 8px; --cds-pad-md: 14px; --cds-pad-lg: 20px; --cds-dur-slow: 300ms;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-bg: #1c1b19; --color-panel: #262523; --color-fg: #f2f0ea; --color-fg-muted: #a6a39b;
+    --color-border-line: #3a3935; --cds-text-secondary: #a6a39b; --cds-surface-popover: #2e2d2a; --cds-border: #45433e;
+    --cds-shadow-popover: 0 4px 16px rgba(0,0,0,.45);
+    --cds-chart-muted: #55534d; --cds-chart-grid: #34332f; --cds-chart-axis: #8a877f; --cds-chart-reference: #8a877f;
+    --kc-s0: #e07a56; --kc-s1: #6f9be0; --kc-s2: #a3b85c; --color-bad: #e06b5b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-bg: #1c1b19; --color-panel: #262523; --color-fg: #f2f0ea; --color-fg-muted: #a6a39b;
+  --color-border-line: #3a3935; --cds-text-secondary: #a6a39b; --cds-surface-popover: #2e2d2a; --cds-border: #45433e;
+  --cds-shadow-popover: 0 4px 16px rgba(0,0,0,.45);
+  --cds-chart-muted: #55534d; --cds-chart-grid: #34332f; --cds-chart-axis: #8a877f; --cds-chart-reference: #8a877f;
+  --kc-s0: #e07a56; --kc-s1: #6f9be0; --kc-s2: #a3b85c; --color-bad: #e06b5b;
+}
+html, body { margin: 0; background: var(--color-bg); color: var(--color-fg); font-family: var(--font-anthropic-sans); }
+#dash-root { padding: 28px 16px 48px; box-sizing: border-box; overflow-x: hidden; }
+@media (min-width: 720px) { #dash-root { padding: 40px 32px 64px; } }
+#dash-root * { box-sizing: border-box; }
+.dash-skeleton:empty, b.dash-skeleton { min-width: 3ch; }
+.kc-footer { max-width: 1180px; margin: 32px auto 0; font-size: 12px; color: var(--color-fg-muted); line-height: 1.5; }
+</style>
+<script>
+// Sustituto local de la API del dashboard: datos incrustados, cálculos y parámetros en memoria.
+(() => {
+  const DATA = { ko_inputs: [{"empresa": "Coca-Cola (KO)", "precio": 90.36, "dividendo_anual": 2.08, "rf": 0.0489, "vol": 0.17, "ytm_bono": 0.053, "plazo": 6, "monto_mm": 2000, "prima_base": 0.25, "prima_warrant": 0.6, "vol_warrant": 0.17}], molson_ref: [{"empresa": "Molson Coors (2007)", "precio": 87.61, "dividendo_anual": 0, "rf": 0.0446, "vol": 0.23, "ytm_bono": 0.0575, "plazo": 6, "monto_mm": 575, "prima_base": 0.25, "prima_warrant": 0.6, "vol_warrant": 0.21}] };
+  const calcs = {}, cache = {}, subs = [];
+  let params = { prima: 25 };
+  const get = (id) => {
+    if (id in DATA) return DATA[id];
+    if (id in cache) return cache[id];
+    const c = calcs[id]; if (!c) return undefined;
+    return (cache[id] = c.fn(...c.inputs.map(get)));
+  };
+  const run = () => subs.forEach((fn) => { try { fn(); } catch (e) { console.error(e); } });
+  window.dash = {
+    colors: ['var(--kc-s0)', 'var(--kc-s1)', 'var(--kc-s2)'],
+    data: (id) => { const d = get(id); return d === undefined ? { status: 'missing', data: [] } : { status: 'ok', data: d, columns: d[0] ? Object.keys(d[0]) : [], meta: [] }; },
+    calc: (id, def) => { calcs[id] = def; },
+    loader: () => {},
+    onData: (fn) => { subs.push(fn); fn(); },
+    params: () => ({ ...params }),
+    setParams: (p) => { params = { ...params, ...p }; run(); },
+    resetParams: () => { params = { prima: 25 }; run(); },
+    refresh: () => {}, setLink: () => {},
+  };
+  let t; window.addEventListener('resize', () => { clearTimeout(t); t = setTimeout(run, 120); });
+})();
+</script>
+</head>
+<body>
+<div id="dash-root">
+<style>
+#dash-root { --dash-gutter: var(--cds-pad-lg); }
+.kc { max-width: 1180px; margin-inline: auto; font-family: var(--font-anthropic-sans); display: flex; flex-direction: column; gap: var(--cds-gap-xl); }
+.kc-head h1 { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); margin: 0 0 var(--cds-gap-xs); }
+.kc-take { color: var(--color-fg-muted); font-size: var(--cds-font-size-body); margin: 0; max-width: 62rem; line-height: 1.5; }
+.kc-take b, .kc-kpi b { font-weight: 500; color: var(--color-fg); }
+.kc-ctrl { display: flex; align-items: center; gap: var(--cds-gap-md); flex-wrap: wrap; font-size: var(--cds-font-size-body); }
+.kc-ctrl input { flex: 1 1 14rem; max-width: 22rem; accent-color: var(--color-fg); }
+.kc-ctrl .kc-pv { font-family: var(--font-anthropic-serif); font-size: var(--cds-font-size-title); min-width: 4ch; }
+.kc-ctrl .kc-note { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+.kc-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); gap: var(--cds-gap-md); }
+.kc-kpi { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-md) var(--cds-pad-lg); }
+.kc-kpi .lbl { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+.kc-kpi .val { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); font-variant-numeric: tabular-nums; margin-top: var(--cds-gap-xs); }
+.kc-kpi .sub { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin-top: var(--cds-gap-xs); }
+.kc h2 { font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); margin: 0 0 var(--cds-gap-sm); }
+.kc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 26rem), 1fr)); gap: var(--cds-gap-md); }
+.kc-card { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-lg); min-width: 0; }
+.kc-card h3 { font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); margin: 0; }
+.kc-card .note { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); margin: var(--cds-gap-xs) 0 var(--cds-gap-md); line-height: 1.45; }
+.kc-chart { position: relative; min-height: 260px; }
+.kc-chart.short { min-height: 190px; }
+.kc-tip { position: absolute; pointer-events: none; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); border-radius: var(--cds-radius); box-shadow: var(--cds-shadow-popover); padding: var(--cds-pad-xs) var(--cds-pad-sm); font-size: var(--cds-font-size-caption); white-space: nowrap; display: none; z-index: 2; }
+.kc-tip .h { color: var(--cds-text-secondary); margin-bottom: 2px; }
+.kc-tip .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
+.kc-legend { display: flex; flex-wrap: wrap; gap: var(--cds-gap-md); font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin-bottom: var(--cds-gap-sm); }
+.kc-legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; background: var(--sw); }
+.kc-legend .dash::before { height: 0; border-top: 2px dashed var(--sw); background: none; vertical-align: 3px; }
+.kc-table { width: 100%; border-collapse: collapse; font-size: var(--cds-font-size-body); font-variant-numeric: tabular-nums; }
+.kc-table th, .kc-table td { padding: var(--cds-pad-xs) var(--cds-pad-sm); border-bottom: 1px solid var(--color-border-line); text-align: right; }
+.kc-table th:first-child, .kc-table td:first-child { text-align: left; }
+.kc-table th { font-weight: var(--cds-font-weight-medium); color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+.kc-wrap { overflow-x: auto; }
+.kc-list { margin: 0; padding-left: 1.1rem; font-size: var(--cds-font-size-body); line-height: 1.6; }
+.kc-list code { font-size: var(--cds-font-size-caption); background: var(--color-bg); border: 1px solid var(--color-border-line); border-radius: 4px; padding: 0 4px; }
+.kc-fail { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: inherit; color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+.kc-fail::before { content: ""; width: .375rem; height: .375rem; border-radius: 50%; background: var(--color-bad); }
+[data-dash-source-state=empty] { color: transparent; }
+[data-dash-source-state=refreshing] { opacity: .5; transition: opacity var(--cds-dur-slow); }
+</style>
+
+<div class="kc">
+  <header class="kc-head" id="resumen">
+    <h1>Coca-Cola: ¿cómo valuar un bono convertible?</h1>
+    <p class="kc-take">Réplica del caso Molson Coors aplicada a una emisión hipotética de KO. Con una prima de conversión de
+      <b class="kc-p">—</b>, el dividendo de KO reduce la opción de conversión de
+      <b class="dash-skeleton" data-source="curva" data-field="opcion_bono" data-k="KO sin dividendo">—</b> a
+      <b class="dash-skeleton" data-source="curva" data-field="opcion_bono" data-k="KO">—</b> por bono, así que el cupón de equilibrio sube a
+      <b class="dash-skeleton" data-source="curva" data-field="cupon" data-k="KO">—</b> (vs.
+      <b class="dash-skeleton" data-source="curva" data-field="cupon" data-k="KO sin dividendo">—</b> sin dividendo) y el ahorro frente a deuda directa es de
+      <b class="dash-skeleton" data-source="curva" data-field="ahorro_bps" data-k="KO">—</b> pb.</p>
+  </header>
+
+  <div class="kc-ctrl" id="prima">
+    <label for="kc-slider">Prima de conversión</label>
+    <input id="kc-slider" type="range" min="10" max="80" step="5" value="25" aria-label="Prima de conversión">
+    <span class="kc-pv">—</span>
+    <span class="kc-note">Mueve la prima para ver cómo cambian el cupón y la opción (caso Molson: 25%).</span>
+  </div>
+
+  <div class="kc-kpis" id="kpis">
+    <div class="kc-kpi"><div class="lbl">Precio de conversión</div>
+      <div class="val dash-skeleton" data-source="curva" data-field="precio_conv" data-k="KO">—</div>
+      <div class="sub"><span data-source="curva" data-field="acciones_bono" data-k="KO">—</span> acciones por bono de $1,000</div></div>
+    <div class="kc-kpi"><div class="lbl">Valor de la opción por bono</div>
+      <div class="val dash-skeleton" data-source="curva" data-field="opcion_bono" data-k="KO">—</div>
+      <div class="sub">Black-Scholes con dividendo · delta <span data-source="curva" data-field="delta" data-k="KO">—</span></div></div>
+    <div class="kc-kpi"><div class="lbl">Valor del bono directo</div>
+      <div class="val dash-skeleton" data-source="curva" data-field="bono" data-k="KO">—</div>
+      <div class="sub">$1,000 menos la opción</div></div>
+    <div class="kc-kpi"><div class="lbl">Cupón de equilibrio</div>
+      <div class="val dash-skeleton" data-source="curva" data-field="cupon" data-k="KO">—</div>
+      <div class="sub">vs. rendimiento deuda directa <span data-source="curva" data-field="ytm" data-k="KO">—</span></div></div>
+    <div class="kc-kpi"><div class="lbl">Ahorro anual en intereses</div>
+      <div class="val dash-skeleton" data-source="curva" data-field="ahorro_anual_mm" data-k="KO">—</div>
+      <div class="sub">sobre <span data-source="curva" data-field="monto_mm" data-k="KO">—</span> emitidos</div></div>
+  </div>
+
+  <section id="valuacion">
+    <h2>1 · Convertible = bono directo + opción call</h2>
+    <div class="kc-grid">
+      <div class="kc-card" id="descomposicion">
+        <h3>De qué está hecho cada bono de $1,000</h3>
+        <p class="note">A la prima elegida. El cupón se fija para que bono + opción = $1,000 (Exhibit 3 del caso).</p>
+        <div class="kc-legend"><span style="--sw: var(--cds-chart-muted)">Bono directo</span><span style="--sw: var(--kc-c0)">Opción de conversión</span></div>
+        <div class="kc-chart short dash-skeleton" id="ch-desc" data-source="curva"></div>
+      </div>
+      <div class="kc-card" id="cupon-prima">
+        <h3>Prima de conversión vs. cupón</h3>
+        <p class="note">Más prima → opción más fuera del dinero → vale menos → el cupón debe subir. La línea punteada es el rendimiento de la deuda directa de KO.</p>
+        <div class="kc-legend kc-leg-lines"></div>
+        <div class="kc-chart dash-skeleton" id="ch-curva" data-source="curva"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="call-spread">
+    <h2>2 · Llevar la prima efectiva de 25% a 60% (call spread)</h2>
+    <div class="kc-grid">
+      <div class="kc-card" id="spread">
+        <h3>Costo neto del call spread, % del monto emitido</h3>
+        <p class="note">Comprar calls con strike en la prima base (note hedge) y vender warrants al 60%. "No free lunch": el neto siempre es un costo (Exhibit 4).</p>
+        <div class="kc-legend"><span style="--sw: var(--cds-chart-muted)">Costo de la cobertura</span><span style="--sw: var(--kc-c1)">Ingreso por warrants</span><span style="--sw: var(--kc-c0)">Costo neto</span></div>
+        <div class="kc-chart short dash-skeleton" id="ch-spread" data-source="spread"></div>
+      </div>
+      <div class="kc-card" id="comparativo">
+        <h3>KO vs. Molson Coors a la prima base</h3>
+        <p class="note">Los mismos cálculos del caso, con los supuestos de cada empresa.</p>
+        <div class="kc-wrap">
+          <table class="kc-table" data-source="comparativo" data-row-key="metrica">
+            <thead><tr><th data-field="metrica">Métrica</th><th data-field="ko">KO</th><th data-field="ko_sindiv">KO sin dividendo</th><th data-field="molson">Molson Coors</th></tr></thead>
+            <tbody class="dash-skeleton"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="supuestos">
+    <h2>3 · Supuestos y datos a reemplazar con Refinitiv</h2>
+    <div class="kc-grid">
+      <div class="kc-card">
+        <h3>Supuestos actuales</h3>
+        <p class="note">Los de KO son valores de muestra; los de Molson vienen de las teaching notes.</p>
+        <div class="kc-wrap">
+          <table class="kc-table" data-source="supuestos" data-row-key="supuesto">
+            <thead><tr><th data-field="supuesto">Supuesto</th><th data-field="ko">KO (muestra)</th><th data-field="molson">Molson Coors</th></tr></thead>
+            <tbody class="dash-skeleton"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="kc-card">
+        <h3>Qué sacar de Refinitiv</h3>
+        <p class="note">RIC de la acción: <code>KO.N</code>. Fecha de corte única para todos los datos.</p>
+        <ul class="kc-list">
+          <li><b>Precio de la acción</b>: cierre a la fecha de corte.</li>
+          <li><b>Dividendo anualizado</b> (o dividend yield): clave, el caso Molson lo ignora.</li>
+          <li><b>Volatilidad</b>: histórica a 1 año y, si existe, implícita ATM de opciones LEAPS; usa la misma en cobertura y warrants o justifica la diferencia (Molson usa 23% vs. 21%).</li>
+          <li><b>Tasa libre de riesgo</b>: Treasury a 5–7 años (<code>US5YT=RR</code>, <code>US7YT=RR</code>).</li>
+          <li><b>Rendimiento de deuda directa de KO</b> a ~6 años: un bono senior de KO con vencimiento parecido, o la curva de KO.</li>
+          <li><b>Calendario de deuda y cupones</b>: para definir el uso de fondos (qué bonos caros se recomprarían, como el 6.38% de Molson).</li>
+          <li><b>Calificación crediticia y acciones en circulación</b>: para discutir dilución.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+  <div class="kc-tip"></div>
+</div>
+
+<script>
+// Valuación: Black-Scholes-Merton (rendimiento por dividendo continuo q = dividendo / precio) y bono semestral.
+dash.calc('curva', {
+  inputs: ['ko_inputs', 'molson_ref'],
+  title: 'Valuación por prima de conversión',
+  description: 'Opción por bono (Black-Scholes con dividendo), bono directo y cupón de equilibrio para primas de 10% a 80%.',
+  fn: (ko_inputs, molson_ref) => {
+    const N = (x) => { const t = 1 / (1 + 0.2316419 * Math.abs(x)); const d = 0.3989423 * Math.exp(-x * x / 2);
+      const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274)))); return x > 0 ? 1 - p : p; };
+    const call = (S, K, r, q, s, T) => { const d1 = (Math.log(S / K) + (r - q + s * s / 2) * T) / (s * Math.sqrt(T)), d2 = d1 - s * Math.sqrt(T);
+      return { c: S * Math.exp(-q * T) * N(d1) - K * Math.exp(-r * T) * N(d2), delta: Math.exp(-q * T) * N(d1) }; };
+    const series = [['KO', ko_inputs[0], true], ['KO sin dividendo', ko_inputs[0], false], ['Molson Coors', molson_ref[0], true]];
+    const rows = [];
+    for (const [serie, a, conDiv] of series) {
+      const S = +a.precio, r = +a.rf, s = +a.vol, T = +a.plazo, y = +a.ytm_bono, q = conDiv ? +a.dividendo_anual / S : 0;
+      for (let p = 10; p <= 80; p += 5) {
+        const K = S * (1 + p / 100), n = 1000 / K, o = call(S, K, r, q, s, T), w = call(S, K, r, q, +a.vol_warrant, T);
+        const bono = 1000 - o.c * n, i = y / 2, m = Math.round(T * 2), v = Math.pow(1 + i, -m);
+        const cupon = (bono - 1000 * v) / (500 * (1 - v) / i);
+        rows.push({ serie, prima_pct: p, precio_conv: K, acciones_bono: n, call_accion: o.c, warrant_accion: w.c, opcion_bono: o.c * n,
+          delta: o.delta, bono, cupon, ytm: y, ahorro_bps: (y - cupon) * 1e4, monto_mm: +a.monto_mm,
+          ahorro_anual_mm: (y - cupon) * a.monto_mm, prima_base: Math.round(a.prima_base * 100), prima_warrant: Math.round(a.prima_warrant * 100) });
+      }
+    }
+    return rows;
+  },
+});
+dash.calc('spread', {
+  inputs: ['curva'],
+  title: 'Call spread 25% → 60%',
+  description: 'Costo de comprar calls al strike de la prima base, ingreso por vender warrants al 60%, por el número de acciones del convertible.',
+  fn: (curva) => ['KO', 'Molson Coors'].map((serie) => {
+    const base = curva.find((d) => d.serie === serie && d.prima_pct === d.prima_base);
+    const war = curva.find((d) => d.serie === serie && d.prima_pct === d.prima_warrant);
+    const acciones_mm = base.monto_mm / base.precio_conv;
+    const costo = base.call_accion * acciones_mm, ingreso = war.warrant_accion * acciones_mm;
+    return { serie, acciones_mm, costo_mm: costo, ingreso_mm: ingreso, neto_mm: ingreso - costo,
+      costo_pct: costo / base.monto_mm, ingreso_pct: ingreso / base.monto_mm, neto_pct: (ingreso - costo) / base.monto_mm };
+  }),
+});
+dash.calc('comparativo', {
+  inputs: ['curva', 'spread'],
+  title: 'Comparativo a la prima base',
+  description: 'Resultados de cada serie a su prima base y costo neto del call spread.',
+  fn: (curva, spread) => {
+    const at = (serie) => curva.find((d) => d.serie === serie && d.prima_pct === d.prima_base);
+    const k = at('KO'), z = at('KO sin dividendo'), m = at('Molson Coors');
+    const sp = (s) => (spread.find((d) => d.serie === s) || {}).neto_pct;
+    const f = (metrica, campo) => ({ metrica, ko: k[campo], ko_sindiv: z[campo], molson: m[campo] });
+    return [f('Precio de conversión', 'precio_conv'), f('Acciones por bono', 'acciones_bono'), f('Call por acción', 'call_accion'),
+      f('Opción por bono', 'opcion_bono'), f('Bono directo', 'bono'), f('Cupón de equilibrio', 'cupon'), f('Ahorro vs. deuda directa (pb)', 'ahorro_bps'),
+      { metrica: 'Costo neto call spread (% monto)', ko: sp('KO'), ko_sindiv: null, molson: sp('Molson Coors') }];
+  },
+});
+dash.calc('supuestos', {
+  inputs: ['ko_inputs', 'molson_ref'],
+  title: 'Supuestos del modelo',
+  description: 'Los supuestos de cada empresa, uno por fila; el dividend yield es dividendo anual / precio.',
+  fn: (ko_inputs, molson_ref) => {
+    const k = ko_inputs[0], m = molson_ref[0];
+    const f = (supuesto, campo) => ({ supuesto, ko: +k[campo], molson: +m[campo] });
+    return [f('Precio de la acción', 'precio'), f('Dividendo anual por acción', 'dividendo_anual'),
+      { supuesto: 'Dividend yield', ko: k.dividendo_anual / k.precio, molson: m.dividendo_anual / m.precio },
+      f('Tasa libre de riesgo', 'rf'), f('Volatilidad', 'vol'), f('Volatilidad warrants', 'vol_warrant'), f('Rendimiento deuda directa', 'ytm_bono'),
+      f('Plazo (años)', 'plazo'), f('Monto emitido (US$ mm)', 'monto_mm'), f('Prima base', 'prima_base'), f('Prima warrants', 'prima_warrant')];
+  },
+});
+</script>
+
+<script>
+(() => {
+  const root = document.querySelector('.kc');
+  root.style.setProperty('--kc-c0', dash.colors[0]);
+  root.style.setProperty('--kc-c1', dash.colors[1]);
+  const usd = d3.format('$,.2f'), usd0 = d3.format('$,.1f'), pct = d3.format('.2%'), pct1 = d3.format('.1%'), num = d3.format(',.2f'), bps = d3.format(',.0f');
+  const mm = (v) => '$' + d3.format(',.1f')(v) + ' mm';
+  const fmt = { precio_conv: usd, acciones_bono: num, opcion_bono: usd0, bono: usd0, cupon: pct, ytm: pct, ahorro_bps: bps, ahorro_anual_mm: mm, monto_mm: (v) => '$' + d3.format(',')(v) + ' mm', delta: num };
+  const slider = document.getElementById('kc-slider');
+  dash.setParams({ prima: 25 });
+  slider.addEventListener('input', () => dash.setParams({ prima: +slider.value }));
+  const tip = root.querySelector('.kc-tip');
+  const showTip = (event, html) => {
+    tip.replaceChildren(); html.forEach((n) => tip.appendChild(n)); tip.style.display = 'block';
+    const b = root.getBoundingClientRect(), x = event.clientX - b.left, y = event.clientY - b.top, w = tip.offsetWidth;
+    tip.style.left = Math.max(0, Math.min(x + 12, b.width - w)) + 'px'; tip.style.top = (y + 14) + 'px';
+  };
+  const hideTip = () => { tip.style.display = 'none'; };
+  const line = (text, color, cls) => { const d = document.createElement('div'); if (cls) d.className = cls;
+    if (color) { const s = document.createElement('span'); s.className = 'sw'; s.style.background = color; d.appendChild(s); }
+    d.appendChild(document.createTextNode(text)); return d; };
+  const fail = (el) => { el.replaceChildren(); const d = document.createElement('div'); d.className = 'kc-fail'; d.textContent = 'Failed to load'; el.appendChild(d); };
+  const SER = ['KO', 'KO sin dividendo', 'Molson Coors'];
+  const colorOf = (s) => s === 'KO' ? dash.colors[0] : s === 'KO sin dividendo' ? dash.colors[1] : dash.colors[2];
+
+  const legL = root.querySelector('.kc-leg-lines');
+  SER.forEach((s) => { const sp = document.createElement('span'); sp.textContent = s; sp.style.setProperty('--sw', colorOf(s)); legL.appendChild(sp); });
+  const ref = document.createElement('span'); ref.className = 'dash'; ref.textContent = 'Deuda directa KO'; ref.style.setProperty('--sw', 'var(--cds-chart-reference)'); legL.appendChild(ref);
+
+  dash.onData(() => {
+    const p = dash.params().prima ?? 25;
+    if (+slider.value !== p) slider.value = p;
+    root.querySelectorAll('.kc-p, .kc-pv').forEach((el) => { el.textContent = p + '%'; });
+    const c = dash.data('curva');
+    const rows = c.status === 'ok' ? c.data : [];
+    // Cifras marcadas con data-k: fila de la serie a la prima elegida.
+    root.querySelectorAll('[data-source="curva"][data-k]').forEach((el) => {
+      const s = el.dataset.k, f = el.dataset.field;
+      el.setAttribute('data-where', 'serie=' + encodeURIComponent(s) + '&prima_pct=' + p);
+      const r = rows.find((d) => d.serie === s && d.prima_pct === p);
+      if (c.status === 'ok') el.classList.remove('dash-skeleton');
+      el.textContent = r ? fmt[f](r[f]) : '—';
+    });
+
+    // Gráfica 1: descomposición
+    const e1 = document.getElementById('ch-desc');
+    if (c.status === 'error') fail(e1); else if (c.status === 'ok') {
+      e1.classList.remove('dash-skeleton');
+      const W = e1.clientWidth, data = SER.map((s) => rows.find((d) => d.serie === s && d.prima_pct === p)).filter(Boolean);
+      const svg = d3.create('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} 180`);
+      const L = 118, R = 8, x = d3.scaleLinear([0, 1000], [L, W - R]), y = d3.scaleBand(data.map((d) => d.serie), [8, 150]).padding(0.35);
+      (W < 480 ? [0, 500, 1000] : [0, 250, 500, 750, 1000]).forEach((v) => {
+        svg.append('line').attr('x1', x(v)).attr('x2', x(v)).attr('y1', 4).attr('y2', 152).attr('stroke', 'var(--cds-chart-grid)');
+        svg.append('text').attr('x', x(v)).attr('y', 170).attr('text-anchor', v === 0 ? 'start' : v === 1000 ? 'end' : 'middle').attr('fill', 'var(--color-fg-muted)').attr('font-size', 'var(--cds-font-size-caption)').text('$' + d3.format(',')(v));
+      });
+      data.forEach((d) => {
+        const g = svg.append('g');
+        g.append('text').attr('x', 0).attr('y', y(d.serie) + y.bandwidth() / 2).attr('dy', '0.35em').attr('font-size', 'var(--cds-font-size-caption)').attr('fill', 'var(--color-fg)').text(d.serie);
+        g.append('rect').attr('x', x(0)).attr('y', y(d.serie)).attr('width', x(d.bono) - x(0)).attr('height', y.bandwidth()).attr('fill', 'var(--cds-chart-muted)').attr('rx', 3);
+        g.append('rect').attr('x', x(d.bono)).attr('y', y(d.serie)).attr('width', Math.max(0, x(1000) - x(d.bono))).attr('height', y.bandwidth()).attr('fill', dash.colors[0]).attr('rx', 3);
+        g.on('mousemove', (ev) => showTip(ev, [line(d.serie + ' · prima ' + p + '%', null, 'h'), line('Bono directo ' + usd0(d.bono), 'var(--cds-chart-muted)'), line('Opción ' + usd0(d.opcion_bono), dash.colors[0]), line('Cupón ' + pct(d.cupon))]))
+          .on('mouseleave', hideTip);
+      });
+      e1.replaceChildren(svg.node());
+    } else { e1.replaceChildren(); e1.classList.add('dash-skeleton'); }
+
+    // Gráfica 2: cupón vs prima
+    const e2 = document.getElementById('ch-curva');
+    if (c.status === 'error') fail(e2); else if (c.status === 'ok') {
+      e2.classList.remove('dash-skeleton');
+      const W = e2.clientWidth, H = 260, M = { t: 10, r: 12, b: 34, l: 46 };
+      const ytm = (rows.find((d) => d.serie === 'KO') || {}).ytm;
+      const x = d3.scaleLinear([10, 80], [M.l, W - M.r]), y = d3.scaleLinear([0, d3.max([ytm, d3.max(rows, (d) => d.cupon)]) * 1.08], [H - M.b, M.t]);
+      const svg = d3.create('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`);
+      y.ticks(5).forEach((v) => {
+        svg.append('line').attr('x1', M.l).attr('x2', W - M.r).attr('y1', y(v)).attr('y2', y(v)).attr('stroke', 'var(--cds-chart-grid)');
+        svg.append('text').attr('x', M.l - 6).attr('y', y(v)).attr('dy', '0.35em').attr('text-anchor', 'end').attr('fill', 'var(--color-fg-muted)').attr('font-size', 'var(--cds-font-size-caption)').text(d3.format('.0%')(v));
+      });
+      (W < 480 ? [10, 30, 50, 80] : [10, 20, 30, 40, 50, 60, 70, 80]).forEach((v) => svg.append('text').attr('x', x(v)).attr('y', H - M.b + 16).attr('text-anchor', v === 80 ? 'end' : 'middle').attr('fill', 'var(--color-fg-muted)').attr('font-size', 'var(--cds-font-size-caption)').text(v + '%'));
+      svg.append('text').attr('x', W - M.r).attr('y', H - 2).attr('text-anchor', 'end').attr('fill', 'var(--color-fg-muted)').attr('font-size', 'var(--cds-font-size-caption)').text('prima de conversión');
+      svg.append('line').attr('x1', M.l).attr('x2', W - M.r).attr('y1', y(ytm)).attr('y2', y(ytm)).attr('stroke', 'var(--cds-chart-reference)').attr('stroke-dasharray', '4 4');
+      svg.append('line').attr('x1', x(p)).attr('x2', x(p)).attr('y1', M.t).attr('y2', H - M.b).attr('stroke', 'var(--cds-chart-axis)');
+      const ln = d3.line().x((d) => x(d.prima_pct)).y((d) => y(d.cupon));
+      SER.forEach((s) => {
+        const pts = rows.filter((d) => d.serie === s);
+        svg.append('path').attr('d', ln(pts)).attr('fill', 'none').attr('stroke', colorOf(s)).attr('stroke-width', 2).attr('stroke-linecap', 'round').attr('stroke-linejoin', 'round');
+        const sel = pts.find((d) => d.prima_pct === p);
+        if (sel) svg.append('circle').attr('cx', x(p)).attr('cy', y(sel.cupon)).attr('r', 4).attr('fill', colorOf(s));
+      });
+      svg.append('rect').attr('x', M.l).attr('y', M.t).attr('width', W - M.l - M.r).attr('height', H - M.t - M.b).attr('fill', 'transparent')
+        .on('mousemove', (ev) => {
+          const [mx] = d3.pointer(ev), pr = Math.max(10, Math.min(80, Math.round(x.invert(mx) / 5) * 5));
+          showTip(ev, [line('Prima ' + pr + '%', null, 'h'), ...SER.map((s) => { const r = rows.find((d) => d.serie === s && d.prima_pct === pr); return line(s + ': cupón ' + pct(r.cupon), colorOf(s)); }), line('Deuda directa KO ' + pct(ytm))]);
+        })
+        .on('mouseleave', hideTip)
+        .on('click', (ev) => { const [mx] = d3.pointer(ev); dash.setParams({ prima: Math.max(10, Math.min(80, Math.round(x.invert(mx) / 5) * 5)) }); });
+      e2.replaceChildren(svg.node());
+    } else { e2.replaceChildren(); e2.classList.add('dash-skeleton'); }
+
+    // Gráfica 3: call spread
+    const e3 = document.getElementById('ch-spread'), sp = dash.data('spread');
+    if (sp.status === 'error') fail(e3); else if (sp.status === 'ok') {
+      e3.classList.remove('dash-skeleton');
+      const W = e3.clientWidth, H = 180, data = sp.data, L = 100, R = 60;
+      const keys = [['costo_pct', 'Costo cobertura', 'var(--cds-chart-muted)'], ['ingreso_pct', 'Ingreso warrants', dash.colors[1]], ['neto_pct', 'Costo neto', dash.colors[0]]];
+      const mx = d3.max(data, (d) => d.costo_pct), x = d3.scaleLinear([0, mx], [L, W - R]);
+      const y0 = d3.scaleBand(data.map((d) => d.serie), [6, H - 6]).paddingInner(0.25), y1 = d3.scaleBand(keys.map((k) => k[0]), [0, y0.bandwidth()]).padding(0.12);
+      const svg = d3.create('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`);
+      data.forEach((d) => {
+        svg.append('text').attr('x', 0).attr('y', y0(d.serie) + y0.bandwidth() / 2).attr('dy', '0.35em').attr('font-size', 'var(--cds-font-size-caption)').attr('fill', 'var(--color-fg)').text(d.serie);
+        keys.forEach(([k, name, col]) => {
+          const v = Math.abs(d[k]), yy = y0(d.serie) + y1(k);
+          svg.append('rect').attr('x', L).attr('y', yy).attr('width', Math.max(1, x(v) - L)).attr('height', y1.bandwidth()).attr('rx', 3).attr('fill', col)
+            .on('mousemove', (ev) => showTip(ev, [line(d.serie, null, 'h'), line(name + ': ' + pct1(v) + ' (' + mm(Math.abs(d[k.replace('_pct', '_mm')])) + ')', col)]))
+            .on('mouseleave', hideTip);
+          svg.append('text').attr('x', x(v) + 6).attr('y', yy + y1.bandwidth() / 2).attr('dy', '0.35em').attr('font-size', 'var(--cds-font-size-caption)').attr('fill', 'var(--color-fg-muted)').text(pct1(v));
+        });
+      });
+      e3.replaceChildren(svg.node());
+    } else { e3.replaceChildren(); e3.classList.add('dash-skeleton'); }
+
+    // Tablas
+    const cmpF = { 'Precio de conversión': usd, 'Acciones por bono': num, 'Call por acción': usd, 'Opción por bono': usd0, 'Bono directo': usd0, 'Cupón de equilibrio': pct, 'Ahorro vs. deuda directa (pb)': bps, 'Costo neto call spread (% monto)': (v) => pct1(-v) };
+    const supF = { 'Precio de la acción': usd, 'Dividendo anual por acción': usd, 'Dividend yield': pct, 'Tasa libre de riesgo': pct, 'Volatilidad': pct1, 'Volatilidad warrants': pct1, 'Rendimiento deuda directa': pct, 'Plazo (años)': d3.format('d'), 'Monto emitido (US$ mm)': (v) => '$' + d3.format(',')(v), 'Prima base': d3.format('.0%'), 'Prima warrants': d3.format('.0%') };
+    const fillTable = (sel, id, cols, fm) => {
+      const tb = root.querySelector(sel + ' tbody'), dt = dash.data(id);
+      if (dt.status !== 'ok') { if (dt.status === 'error') { tb.classList.remove('dash-skeleton'); tb.replaceChildren(); } return; }
+      tb.classList.remove('dash-skeleton'); tb.replaceChildren();
+      dt.data.forEach((r) => {
+        const tr = document.createElement('tr'); const key = r[cols[0]];
+        cols.forEach((col, i) => { const td = document.createElement('td'); const v = r[col];
+          td.textContent = i === 0 ? v : (v == null || Number.isNaN(v) ? '—' : fm[key](v)); tr.appendChild(td); });
+        tb.appendChild(tr);
+      });
+    };
+    fillTable('[data-source="comparativo"]', 'comparativo', ['metrica', 'ko', 'ko_sindiv', 'molson'], cmpF);
+    fillTable('[data-source="supuestos"]', 'supuestos', ['supuesto', 'ko', 'molson'], supF);
+  });
+})();
+</script>
+
+<p class="kc-footer">Supuestos de KO: valores de muestra (precio y dividendo a ago-2026, Treasury 5 años a oct-2026; volatilidad 17%, rendimiento de deuda directa 5.30% y monto US$2,000 mm estimados), a reemplazar con datos de Refinitiv. Supuestos de Molson Coors: teaching notes del caso (Exhibits 2–4). Valuación: Black-Scholes-Merton con rendimiento por dividendo continuo; bono con cupón semestral.</p>
+</div>
+</body>
+</html>
