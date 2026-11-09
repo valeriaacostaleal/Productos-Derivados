@@ -1,0 +1,658 @@
+---
+title: "Tarea 6: GARCH, Monte Carlo y árboles binomiales con Coca-Cola (KO)"
+subtitle: "Productos Derivados — Clase 6"
+author: "Equipo 8: Maria Cecilia Cantú, Melissa Arizoca, Valeria Acosta"
+date: "Datos de LSEG Workspace al 30 de octubre de 2026"
+lang: es
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: hide
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 4.5)
+
+# Librerías (instalar una sola vez con install.packages() si faltan)
+library(tidyverse)   # manejo de datos y gráficas
+library(readxl)      # leer los archivos exportados de LSEG
+library(plotly)      # gráficas interactivas
+library(DT)          # tablas interactivas
+library(htmltools)   # tarjetas de indicadores
+
+tarjeta <- function(valor, etiqueta, nota = NULL, color = "#1F3B5C") {
+  sin_dolar <- function(x) HTML(gsub("$", "&#36;", x, fixed = TRUE))   # evita que el signo de pesos se lea como fórmula
+  valor <- sin_dolar(valor); etiqueta <- sin_dolar(etiqueta); if (!is.null(nota)) nota <- sin_dolar(nota)
+  div(style = paste0("display:inline-block; width:31%; min-width:180px; margin:0 1% 12px 0; padding:12px 14px;",
+                     "border-left:5px solid ", color, "; background:#f6f8fa; border-radius:6px; vertical-align:top;"),
+      div(style = "font-size:24px; font-weight:700; color:#1F3B5C;", valor),
+      div(style = "font-size:13px; color:#333;", etiqueta),
+      if (!is.null(nota)) div(style = "font-size:11px; color:#777; margin-top:2px;", nota))
+}
+fila <- function(...) div(style = "margin:8px 0 6px 0;", ...)
+usd <- function(x, d = 2) paste0("US$", formatC(x, format = "f", digits = d, big.mark = ","))
+pct <- function(x, d = 1) paste0(formatC(100 * x, format = "f", digits = d), "%")
+```
+
+<style>
+h1 { font-size: 26px; } h2 { font-size: 21px; margin-top: 30px; } h3 { font-size: 17px; }
+.nota { background:#fff7e6; border-left:4px solid #e0a100; padding:8px 12px; border-radius:4px; font-size:14px; }
+</style>
+
+<div class="nota">
+**Qué es este documento:** la **Tarea 6** (GARCH, Monte Carlo, árboles binomiales de opciones americanas a 1–3 meses y estrategia en Investopedia). El **avance 2 del proyecto final** (bono convertible de KO) va en otro archivo, `Avance2_Proyecto_KO.html`, y usa el mismo modelo GARCH de aquí.
+Repositorio: <https://github.com/valeriaacostaleal/Productos-Derivados>
+</div>
+
+## Resumen
+
+Usamos 5 años de precios diarios de KO (LSEG) para estimar un modelo **GARCH(1,1)**, pronosticar la volatilidad y simular el precio con **Monte Carlo**. Después valuamos las opciones americanas de KO que vencen en diciembre de 2026 y enero de 2027 con **árboles binomiales** (incluyendo el dividendo de diciembre) y usamos todo esto para elegir y evaluar las dos estrategias que compramos en **Investopedia** sobre 100 acciones de KO: **(1) una call americana de US\$97.50** para ganar más si KO sube y **(2) una put americana de US\$90** para protegernos si cae, las dos con vencimiento el 18 de diciembre de 2026.
+
+## 1. Datos
+
+```{r datos}
+# ---- Precios diarios de KO (LSEG: Price & Charts > Price History, 5 años, exportado a Excel) ----
+ph <- read_excel("datos/KO_precios_5a.xlsx", col_names = FALSE, .name_repair = "minimal")
+inicio <- which(ph[[1]] == "Exchange Date")
+precios <- ph[(inicio + 1):nrow(ph), 1:2] %>%
+  setNames(c("fecha", "cierre")) %>%
+  mutate(fecha = as.Date(as.numeric(fecha), origin = "1899-12-30"), cierre = as.numeric(cierre)) %>%
+  filter(!is.na(fecha), !is.na(cierre)) %>%
+  arrange(fecha)
+u <- 100 * diff(log(precios$cierre))       # rendimientos diarios en %
+n <- length(u)
+S0 <- tail(precios$cierre, 1)              # 94.08 al 30-oct-2026
+
+# ---- Cadena de opciones de KO (LSEG: KO.N > Derivatives > Options, cierre del 30-oct-2026) ----
+cadena <- read_csv("datos/KO_opciones_1a3m.csv", show_col_types = FALSE) %>%
+  mutate(vencimiento = as.Date(vencimiento), mid = (bid + ask) / 2)
+
+# ---- Supuestos de mercado ----
+hoy         <- as.Date("2026-10-30")
+r           <- 0.0408                      # fondos federales efectivos (LSEG USFFE=), como tasa libre de riesgo a 1-3 meses
+dividendo   <- 0.53                        # dividendo trimestral de KO (US$2.12 al año)
+fecha_exdiv <- as.Date("2026-12-01")       # estimada: en 2024 fue el 29-nov y en 2025 el 1-dic
+entrega     <- as.Date("2026-11-13")       # fecha supuesta de entrega del proyecto final (2 semanas)
+
+# Días hábiles de bolsa entre dos fechas (sin fines de semana ni feriados de NYSE)
+feriados <- as.Date(c("2026-11-26", "2026-12-25", "2027-01-01"))
+dias_habiles <- function(desde, hasta) {
+  d <- seq(desde + 1, hasta, by = "day")
+  sum(as.POSIXlt(d)$wday %in% 1:5 & !(d %in% feriados))
+}
+```
+
+```{r tarjetas-datos, echo = FALSE}
+fila(
+  tarjeta(usd(S0), "Precio de KO", "Cierre del 30-oct-2026"),
+  tarjeta(format(n + 1, big.mark = ","), "Días de precios", paste0(format(min(precios$fecha), "%d-%b-%Y"), " a ", format(max(precios$fecha), "%d-%b-%Y"))),
+  tarjeta(nrow(cadena), "Opciones de la cadena", "Vencimientos 18-dic-2026 y 15-ene-2027")
+)
+```
+
+```{r grafica-precio}
+plot_ly(precios, x = ~fecha, y = ~cierre, type = "scatter", mode = "lines", line = list(color = "#C8102E"),
+        hovertemplate = "%{x}<br>US$%{y:.2f}<extra></extra>") %>%
+  layout(title = list(text = "Precio de KO — últimos 5 años (LSEG)", font = list(size = 15)),
+         xaxis = list(title = ""), yaxis = list(title = "USD por acción"))
+```
+
+**¿Por qué 5 años?** Primero probamos con 2 años y el GARCH salía con β casi en cero, que es poco realista para una acción. Con 5 años el modelo tiene más episodios de volatilidad alta y baja para aprender, y los parámetros salen estables. Además, es el mismo periodo que se usa en el Colab de la clase.
+
+## 2. Volatilidad: histórica, EWMA y GARCH(1,1)
+
+La volatilidad es el dato más importante para valuar una opción. La medimos de tres formas (Hull, cap. 23):
+
+* **Histórica:** desviación estándar de los rendimientos del último año. Le da el mismo peso a todos los días.
+* **EWMA:** les da más peso a los días recientes (λ = 0.94).
+* **GARCH(1,1):** además de darles más peso a los días recientes, supone que la volatilidad **regresa a un nivel de largo plazo**.
+
+<p style="text-align:center; font-size:16px;">varianza de mañana = ω + α × (rendimiento de hoy)² + β × (varianza de hoy)</p>
+
+```{r garch}
+# Varianza día por día con GARCH(1,1); con w = 0, a = 1 - lambda y b = lambda es EWMA
+varianzas <- function(w, a, b, u, s2_inicial = var(u)) {
+  x <- w + a * head(u, -1)^2
+  c(s2_inicial, as.numeric(stats::filter(x, b, method = "recursive", init = s2_inicial)))
+}
+logv <- function(s2, u) -0.5 * sum((log(2 * pi) + log(s2) + u^2 / s2)[-1])   # log-verosimilitud
+
+# Estimación por máxima verosimilitud; los parámetros se transforman para que siempre sean válidos
+estimar_garch <- function(u, inicios = list(c(0.05, 0.90), c(0.10, 0.85), c(0.05, 0.80))) {
+  nll <- function(th) { a <- plogis(th[2]); b <- plogis(th[3]) * (1 - a); -logv(varianzas(exp(th[1]), a, b, u), u) }
+  mejor <- NULL
+  for (ini in inicios) {
+    a0 <- ini[1]; b0 <- ini[2]
+    o <- optim(c(log(var(u) * (1 - a0 - b0)), qlogis(a0), qlogis(b0 / (1 - a0))), nll, control = list(maxit = 5000))
+    if (is.null(mejor) || o$value < mejor$value) mejor <- o
+  }
+  a <- plogis(mejor$par[2])
+  c(w = exp(mejor$par[1]), a = a, b = plogis(mejor$par[3]) * (1 - a), ll = -mejor$value)
+}
+
+g <- estimar_garch(u)
+w <- g[["w"]]; a <- g[["a"]]; b <- g[["b"]]
+VL <- w / (1 - a - b)                                   # varianza diaria de largo plazo (en %²)
+s2 <- varianzas(w, a, b, u)
+s2_manana <- w + a * tail(u, 1)^2 + b * tail(s2, 1)      # varianza pronosticada para el 2-nov-2026
+anual <- function(s2) sqrt(s2 * 252) / 100              # de varianza diaria en %² a volatilidad anual
+vol_lp <- anual(VL); vol_hoy <- anual(s2_manana)
+vida_media <- log(0.5) / log(a + b)
+
+# Histórica y EWMA
+vol_hist_1a <- sd(tail(u, 252)) * sqrt(252) / 100
+s2_ewma <- varianzas(0, 0.06, 0.94, u)
+vol_ewma <- anual(0.06 * tail(u, 1)^2 + 0.94 * tail(s2_ewma, 1))
+
+tibble(Parámetro = c("ω (omega)", "α (alfa): peso del movimiento de hoy", "β (beta): peso de la varianza de ayer",
+                     "α + β (persistencia)", "Volatilidad de largo plazo (anual)", "Volatilidad para mañana (anual)",
+                     "Días para que un choque se reduzca a la mitad"),
+       Valor = c(round(w, 4), round(a, 4), round(b, 4), round(a + b, 4), pct(vol_lp), pct(vol_hoy), round(vida_media, 1))) %>%
+  datatable(rownames = FALSE, options = list(dom = "t", ordering = FALSE), caption = "GARCH(1,1) de KO estimado por máxima verosimilitud (rendimientos en %)")
+```
+
+```{r tarjetas-vol, echo = FALSE}
+fila(
+  tarjeta(pct(vol_hist_1a), "Volatilidad histórica (1 año)"),
+  tarjeta(pct(vol_ewma), "Volatilidad EWMA (λ = 0.94)"),
+  tarjeta(pct(vol_hoy), "Volatilidad GARCH para mañana", paste0("Largo plazo: ", pct(vol_lp)), color = "#C8102E")
+)
+```
+
+```{r grafica-garch}
+vol_dia <- tibble(fecha = precios$fecha[-1], GARCH = anual(s2) * 100, EWMA = anual(s2_ewma) * 100,
+                  movimiento = abs(u) * sqrt(252))
+plot_ly(vol_dia, x = ~fecha) %>%
+  add_bars(y = ~movimiento, name = "Tamaño del movimiento diario (anualizado)", marker = list(color = "#e1e4e8")) %>%
+  add_lines(y = ~EWMA, name = "EWMA", line = list(color = "#7a8ca0", width = 1)) %>%
+  add_lines(y = ~GARCH, name = "GARCH", line = list(color = "#C8102E")) %>%
+  add_lines(x = range(vol_dia$fecha), y = rep(vol_lp * 100, 2), name = "Largo plazo (GARCH)", line = list(color = "#1F3B5C", dash = "dash")) %>%
+  layout(title = list(text = "Volatilidad diaria de KO (anualizada)", font = list(size = 15)),
+         xaxis = list(title = ""), yaxis = list(title = "%", range = c(0, 60)), legend = list(orientation = "h", y = -0.15))
+```
+
+**Lectura.** α + β = `r round(a + b, 3)`: la volatilidad de KO tiene "memoria". Cuando hay un día de movimiento fuerte (por ejemplo, un reporte trimestral), la volatilidad sube y tarda unos **`r round(vida_media)` días** en bajar a la mitad. Hoy el modelo ve una volatilidad de **`r pct(vol_hoy)`**, arriba de su nivel normal de **`r pct(vol_lp)`**, porque KO tuvo movimientos fuertes a finales de octubre (subió 2.8% el 22-oct y bajó 2.7% el 23-oct). Se espera que poco a poco regrese a ese nivel.
+
+### ¿Qué modelo explica mejor los datos?
+
+```{r comparar-modelos}
+ll_const <- logv(rep(var(u), n), u)
+ll_ewma  <- logv(s2_ewma, u)
+lam_opt  <- optimize(function(l) -logv(varianzas(0, 1 - l, l, u), u), c(0.80, 0.999))$minimum
+s2_eopt  <- varianzas(0, 1 - lam_opt, lam_opt, u)
+ljung <- function(s2) Box.test(u^2 / s2, lag = 10, type = "Ljung-Box")$p.value
+
+tibble(Modelo = c("Volatilidad constante", "EWMA λ = 0.94", paste0("EWMA λ óptimo (", round(lam_opt, 3), ")"), "GARCH(1,1)"),
+       Parámetros = c(1, 0, 1, 3),
+       `Log-verosimilitud` = c(ll_const, ll_ewma, logv(s2_eopt, u), g[["ll"]]),
+       `p Ljung-Box` = c(ljung(rep(var(u), n)), ljung(s2_ewma), ljung(s2_eopt), ljung(s2))) %>%
+  mutate(AIC = -2 * `Log-verosimilitud` + 2 * Parámetros, BIC = -2 * `Log-verosimilitud` + Parámetros * log(n)) %>%
+  datatable(rownames = FALSE, options = list(dom = "t", ordering = FALSE),
+            caption = "Más log-verosimilitud y menos AIC/BIC = mejor modelo; p de Ljung-Box > 0.05 = ya no queda patrón en la volatilidad") %>%
+  formatRound(3:6, 3)
+```
+
+**Lectura.** El GARCH tiene la log-verosimilitud más alta y el AIC/BIC más bajo, así que es el que mejor describe cómo se mueve KO. Con volatilidad constante la prueba de Ljung-Box sale en cero (los días de mucha volatilidad vienen juntos y ese modelo no lo captura); con GARCH el p-valor pasa de 0.05, o sea que el modelo sí captura ese patrón.
+
+### Pronóstico de volatilidad por plazo
+
+Para valuar una opción no sirve la volatilidad de mañana, sino la **volatilidad promedio esperada durante la vida de la opción** (Hull 23.6).
+
+```{r estructura}
+vol_promedio <- function(dias) { h <- 1:dias; anual(mean(VL + (a + b)^(h - 1) * (s2_manana - VL))) }
+dias_dic <- dias_habiles(hoy, as.Date("2026-12-18")); dias_ene <- dias_habiles(hoy, as.Date("2027-01-15"))
+dias_entrega <- dias_habiles(hoy, entrega)
+
+plazos <- tibble(Plazo = c("2 semanas (entrega del proyecto)", "Vencimiento 18-dic-2026", "Vencimiento 15-ene-2027",
+                           "6 meses", "1 año", "6 años (bono convertible)"),
+                 `Días hábiles` = c(dias_entrega, dias_dic, dias_ene, 126, 252, 1512)) %>%
+  mutate(`Volatilidad GARCH promedio` = map_dbl(`Días hábiles`, vol_promedio))
+datatable(plazos, rownames = FALSE, options = list(dom = "t", ordering = FALSE)) %>% formatPercentage(3, 1)
+
+curva_vol <- tibble(dias = 1:504, vol = map_dbl(1:504, vol_promedio) * 100)
+plot_ly(curva_vol, x = ~dias, y = ~vol, type = "scatter", mode = "lines", line = list(color = "#C8102E"), name = "GARCH") %>%
+  add_lines(x = c(1, 504), y = rep(vol_lp * 100, 2), name = "Largo plazo", line = list(color = "#1F3B5C", dash = "dash")) %>%
+  layout(title = list(text = "Volatilidad promedio esperada según el plazo de la opción", font = list(size = 15)),
+         xaxis = list(title = "Días hábiles al vencimiento"), yaxis = list(title = "%"))
+```
+
+**Lectura.** Mientras más largo el plazo, más se acerca la volatilidad a su nivel de largo plazo. Para las opciones de diciembre usamos **`r pct(vol_promedio(dias_dic))`** y para el convertible del proyecto (6 años) **`r pct(vol_promedio(1512))`**.
+
+## 3. Monte Carlo con GARCH: pronóstico del precio de KO
+
+Simulamos **20,000 caminos** del precio de KO, día por día. Cada día la volatilidad se actualiza con el GARCH, así que si un día hay un movimiento grande, los días siguientes también son más volátiles. Para pronosticar suponemos un rendimiento esperado de 7% anual (más o menos el promedio histórico de KO con dividendos).
+
+```{r montecarlo}
+set.seed(2026)
+n_sim <- 20000; mu <- 0.07
+dias_sim <- dias_dic                               # simulamos hasta el vencimiento de diciembre
+camino <- matrix(NA, dias_sim + 1, n_sim); camino[1, ] <- S0
+v <- rep(s2_manana, n_sim)
+for (d in 1:dias_sim) {
+  e <- sqrt(v) * rnorm(n_sim)                      # choque del día (en %)
+  camino[d + 1, ] <- camino[d, ] * exp((100 * mu / 252 - 0.5 * v / 100 + e) / 100)
+  v <- w + a * e^2 + b * v
+}
+S_entrega <- camino[dias_entrega + 1, ]
+S_dic <- camino[dias_sim + 1, ]
+q2s <- quantile(S_entrega, c(0.05, 0.25, 0.5, 0.75, 0.95))
+```
+
+```{r grafica-montecarlo}
+fechas_sim <- c(hoy, seq(hoy + 1, as.Date("2026-12-18"), by = "day") %>% .[as.POSIXlt(.)$wday %in% 1:5 & !(. %in% feriados)])
+abanico <- tibble(fecha = fechas_sim,
+                  p05 = apply(camino, 1, quantile, 0.05), p25 = apply(camino, 1, quantile, 0.25),
+                  p50 = apply(camino, 1, quantile, 0.50), p75 = apply(camino, 1, quantile, 0.75),
+                  p95 = apply(camino, 1, quantile, 0.95))
+gm <- plot_ly(abanico, x = ~fecha)
+for (k in 1:25) gm <- gm %>% add_lines(y = camino[, k], line = list(color = "rgba(150,150,150,0.3)", width = 1), showlegend = FALSE, hoverinfo = "skip")
+gm %>%
+  add_ribbons(ymin = ~p05, ymax = ~p95, fillcolor = "rgba(200,16,46,0.12)", line = list(width = 0), name = "90% de los escenarios") %>%
+  add_ribbons(ymin = ~p25, ymax = ~p75, fillcolor = "rgba(200,16,46,0.25)", line = list(width = 0), name = "50% de los escenarios") %>%
+  add_lines(y = ~p50, line = list(color = "#C8102E", width = 2), name = "Mediana") %>%
+  add_lines(x = range(abanico$fecha), y = c(97.5, 97.5), line = list(color = "#1F3B5C", dash = "dash"), name = "Strike de nuestra call (97.50)") %>%
+  add_lines(x = c(entrega, entrega), y = c(75, 115), line = list(color = "grey", dash = "dot"), name = "Entrega del proyecto (13-nov)") %>%
+  layout(title = list(text = "Monte Carlo GARCH: precio de KO hasta el 18-dic-2026", font = list(size = 15)),
+         xaxis = list(title = ""), yaxis = list(title = "US$", range = c(75, 115)), legend = list(orientation = "h", y = -0.15))
+```
+
+```{r tarjetas-mc, echo = FALSE}
+fila(
+  tarjeta(usd(q2s[3]), "Precio mediano al 13-nov", paste0("Hoy: ", usd(S0))),
+  tarjeta(paste0(usd(q2s[1]), " – ", usd(q2s[5])), "Rango probable al 13-nov", "90% de los escenarios"),
+  tarjeta(pct(mean(S_entrega > S0), 0), "Probabilidad de que KO suba en 2 semanas", color = "#C8102E"),
+  tarjeta(pct(vol_promedio(dias_entrega)), "Volatilidad GARCH promedio en 2 semanas"),
+  tarjeta(pct(mean(S_dic > 97.5), 0), "Probabilidad de que KO cierre arriba de 97.50", "El 18-dic, vencimiento de nuestra call"),
+  tarjeta(usd(-quantile(S_entrega - S0, 0.01) * 100, 0), "VaR 99% a 2 semanas (100 acciones)", "Pérdida que solo se supera en 1% de los escenarios")
+)
+```
+
+**Lectura.** En dos semanas lo más probable es que KO se mueva poco: el 50% de los escenarios queda entre US\$`r round(q2s[2], 2)` y US\$`r round(q2s[4], 2)`. Hay un poco más de probabilidad de que suba que de que baje, por el rendimiento esperado que supusimos. Para que nuestra call termine con valor, KO tiene que pasar de US\$97.50 el 18 de diciembre, y eso pasa en `r pct(mean(S_dic > 97.5), 0)` de los escenarios.
+
+### ¿El modelo mide bien el riesgo? Back testing del VaR
+
+Revisamos los últimos 2 años: cada día calculamos el VaR de un día con la volatilidad que el modelo tenía **ese día** (el GARCH se reestima cada 63 días, sin ver el futuro) y contamos cuántas veces la pérdida real fue mayor. La prueba de Kupiec dice si ese número es razonable (p > 0.05 = el modelo pasa).
+
+```{r backtest}
+dias_bt <- (n - 501):n
+bloques <- split(dias_bt, ceiling(seq_along(dias_bt) / 63))
+s2_bt_garch <- unlist(lapply(bloques, function(blq) {
+  t0 <- blq[1]; pg <- estimar_garch(u[1:(t0 - 1)], inicios = list(c(0.05, 0.90), c(0.10, 0.85)))
+  varianzas(pg[["w"]], pg[["a"]], pg[["b"]], u[1:max(blq)], var(u[1:(t0 - 1)]))[blq]
+}))
+s2_bt_ewma <- s2_ewma[dias_bt]
+s2_bt_hist <- sapply(dias_bt, function(t) var(u[(t - 250):(t - 1)]))
+
+kupiec <- function(x, n, p) {
+  ph <- x / n
+  lr <- -2 * ((n - x) * log(1 - p) + x * log(p)) + 2 * ((n - x) * log(1 - ph) + ifelse(x > 0, x * log(ph), 0))
+  1 - pchisq(lr, 1)
+}
+bt <- expand_grid(Confianza = c(0.95, 0.99), Modelo = c("GARCH(1,1)", "EWMA", "Histórica 250 días")) %>%
+  mutate(Excepciones = map2_int(Confianza, Modelo, function(cf, m) {
+    s2m <- switch(m, "GARCH(1,1)" = s2_bt_garch, "EWMA" = s2_bt_ewma, s2_bt_hist)
+    sum(u[dias_bt] < -qnorm(cf) * sqrt(s2m))
+  }),
+  Días = length(dias_bt), `Tasa observada` = Excepciones / Días, `Tasa esperada` = 1 - Confianza,
+  `p Kupiec` = pmap_dbl(list(Excepciones, Días, 1 - Confianza), kupiec))
+datatable(bt, rownames = FALSE, options = list(dom = "t", ordering = FALSE)) %>%
+  formatPercentage(c(1, 5, 6), 1) %>% formatRound(7, 3)
+```
+
+**Lectura.** Los tres modelos pasan la prueba (p mayor a 0.05) y la tasa de excepciones del GARCH al 99% queda muy cerca del 1% esperado. Es decir, el modelo no subestima el riesgo de KO y podemos confiar en él para el pronóstico.
+
+## 4. Opciones americanas de 1 a 3 meses (cadena de LSEG)
+
+Para la estrategia usamos opciones **americanas** de KO (se pueden ejercer cualquier día) con vencimientos **18-dic-2026** (`r as.numeric(as.Date("2026-12-18") - hoy)` días) y **15-ene-2027** (`r as.numeric(as.Date("2027-01-15") - hoy)` días). KO paga **US\$0.53 de dividendo**, con fecha ex-dividendo estimada el **1 de diciembre**, antes de los dos vencimientos. Por eso el árbol incluye el dividendo como un pago fijo (Hull 21.3).
+
+```{r smile}
+garch_vto <- tibble(vencimiento = as.Date(c("2026-12-18", "2027-01-15")),
+                    vol_garch = c(vol_promedio(dias_dic), vol_promedio(dias_ene)))
+cad_iv <- cadena %>% filter(!is.na(iv_lseg))
+plot_ly() %>%
+  add_trace(data = filter(cad_iv, vencimiento == as.Date("2026-12-18")), x = ~strike, y = ~iv_lseg * 100, color = ~tipo,
+            colors = c("#1F3B5C", "#C8102E"), type = "scatter", mode = "lines+markers", legendgroup = "dic",
+            name = ~paste("18-dic", tipo)) %>%
+  add_trace(data = filter(cad_iv, vencimiento == as.Date("2027-01-15")), x = ~strike, y = ~iv_lseg * 100, color = ~tipo,
+            type = "scatter", mode = "lines+markers", line = list(dash = "dot"), name = ~paste("15-ene", tipo)) %>%
+  add_lines(x = c(82.5, 115), y = rep(garch_vto$vol_garch[1] * 100, 2), name = "GARCH hasta 18-dic",
+            line = list(color = "grey40", dash = "dash"), inherit = FALSE) %>%
+  add_lines(x = c(S0, S0), y = c(15, 35), name = "Precio de KO", line = list(color = "grey", dash = "dot"), inherit = FALSE) %>%
+  layout(title = list(text = "Volatilidad implícita de LSEG por strike vs. volatilidad GARCH", font = list(size = 15)),
+         xaxis = list(title = "Strike (US$)"), yaxis = list(title = "%", range = c(15, 35)))
+```
+
+**Lectura.** Cerca del precio actual (strikes de 92.5 a 100) la volatilidad implícita del mercado está alrededor de **20%**, casi igual a la que pronostica el GARCH (`r pct(garch_vto$vol_garch[1])`). Eso quiere decir que a 1–3 meses las opciones de KO **no están ni caras ni baratas**: el mercado y nuestro modelo esperan más o menos la misma volatilidad. La volatilidad sube en los strikes bajos (puts de protección), algo normal en acciones.
+
+### Árbol binomial americano con dividendo
+
+En cada nodo el árbol compara **ejercer hoy** contra **esperar**. Para el dividendo, el árbol se construye sobre el precio sin el valor presente del dividendo y se lo suma de regreso en los nodos anteriores a la fecha ex-dividendo.
+
+```{r funcion-arbol}
+arbol_americano <- function(S, K, T, r, sigma, tipo = "call", D = 0, tD = Inf, N = 300, americana = TRUE, detalle = FALSE) {
+  dt <- T / N; u_ <- exp(sigma * sqrt(dt)); d_ <- 1 / u_
+  p <- (exp(r * dt) - d_) / (u_ - d_); desc <- exp(-r * dt)
+  hay_div <- D > 0 && tD > 0 && tD < T
+  S_sin_div <- if (hay_div) S - D * exp(-r * tD) else S
+  precio <- function(i) {                          # precio de la acción en los nodos del paso i
+    s <- S_sin_div * u_^(i:0) * d_^(0:i)
+    if (hay_div && i * dt < tD) s <- s + D * exp(-r * (tD - i * dt))
+    s
+  }
+  pago <- function(s) if (tipo == "call") pmax(s - K, 0) else pmax(K - s, 0)
+  V <- pago(precio(N)); nodos <- list()
+  if (detalle) nodos[[N + 1]] <- tibble(paso = N, sube = N:0, S = precio(N), V = V, ejerce = V > 0)
+  for (i in (N - 1):0) {
+    s <- precio(i)
+    esperar <- desc * (p * V[1:(i + 1)] + (1 - p) * V[2:(i + 2)])
+    ejercer <- pago(s)
+    ejerce <- americana & ejercer > esperar + 1e-9
+    V <- if (americana) pmax(esperar, ejercer) else esperar
+    if (detalle) nodos[[i + 1]] <- tibble(paso = i, sube = i:0, S = s, V = V, ejerce = ejerce)
+  }
+  list(valor = V[1], u = u_, d = d_, p = p, nodos = bind_rows(nodos))
+}
+
+# Control: sin dividendo y europea, el árbol debe dar lo mismo que Black-Scholes
+bs <- function(S, K, T, r, s, tipo = "call") {
+  d1 <- (log(S / K) + (r + s^2 / 2) * T) / (s * sqrt(T)); d2 <- d1 - s * sqrt(T)
+  if (tipo == "call") S * pnorm(d1) - K * exp(-r * T) * pnorm(d2) else K * exp(-r * T) * pnorm(-d2) - S * pnorm(-d1)
+}
+control <- c(arbol = arbol_americano(100, 100, 0.5, 0.05, 0.2, americana = FALSE)$valor, bs = bs(100, 100, 0.5, 0.05, 0.2))
+```
+
+Control del árbol (S = K = 100, σ = 20%, 6 meses, sin dividendo): árbol **`r round(control["arbol"], 4)`** vs. Black-Scholes **`r round(control["bs"], 4)`**. El árbol funciona.
+
+```{r valuar-cadena}
+valuar <- function(fila) {
+  T  <- as.numeric(fila$vencimiento - hoy) / 365
+  tD <- as.numeric(fecha_exdiv - hoy) / 365
+  f  <- function(s, am = TRUE) arbol_americano(S0, fila$strike, T, r, s, fila$tipo, dividendo, tD, americana = am)$valor
+  iv_arbol <- tryCatch(uniroot(function(s) f(s) - fila$mid, c(0.03, 1.5))$root, error = function(e) NA_real_)
+  vg <- garch_vto$vol_garch[garch_vto$vencimiento == fila$vencimiento]
+  tibble(iv_arbol = iv_arbol, vol_garch = vg, arbol_iv = f(fila$iv_lseg), europea_iv = f(fila$iv_lseg, FALSE), arbol_garch = f(vg))
+}
+tabla <- cad_iv %>% rowwise() %>% mutate(valuar(pick(everything()))) %>% ungroup() %>%
+  mutate(prima_ejercicio = arbol_iv - europea_iv, dif_garch_vs_mercado = arbol_garch - mid)
+
+tabla %>%
+  transmute(Vencimiento = format(vencimiento, "%d-%b-%Y"), Tipo = tipo, Strike = strike, `Precio mercado (mid)` = mid,
+            `IV LSEG` = iv_lseg, `IV del árbol` = iv_arbol, `Árbol con IV LSEG` = arbol_iv,
+            `Valor por ejercer antes` = prima_ejercicio, `Árbol con GARCH` = arbol_garch, `GARCH − mercado` = dif_garch_vs_mercado) %>%
+  datatable(rownames = FALSE, filter = "none", options = list(pageLength = 11, dom = "tp", scrollX = TRUE),
+            caption = "Cadena de KO valuada con el árbol americano de 300 pasos (incluye dividendo de US$0.53)") %>%
+  formatPercentage(5:6, 1) %>% formatRound(c(4, 7:10), 3)
+```
+
+**Lectura.**
+
+* Con la volatilidad implícita de LSEG, el árbol reproduce bien los precios de mercado. La "IV del árbol" (la volatilidad que hace que el árbol dé exactamente el precio de mercado) sale un poco abajo de la de LSEG porque usamos otra tasa y otro supuesto de dividendo, pero la diferencia es pequeña.
+* **Poder ejercer antes vale poco:** unos centavos en las opciones cerca del dinero. Pesa más en las calls de diciembre muy dentro del dinero (hasta ~US\$0.20), porque conviene ejercerlas justo antes del ex-dividendo para cobrar los US\$0.53, y en las puts muy dentro del dinero.
+* La columna "GARCH − mercado" es de apenas 1 a 3 centavos cerca del dinero (strikes de 92.5 a 100), así que ahí no hay señal para comprar ni para vender volatilidad. La diferencia es más negativa en los strikes lejanos, sobre todo en las puts bajas: ahí el mercado cobra más volatilidad que la del GARCH, porque los inversionistas pagan extra por protegerse de caídas fuertes.
+
+## 5. Niveles de nodos: los contratos de nuestra estrategia
+
+Para que se vea el árbol usamos **7 pasos semanales** hasta el 18-dic-2026. Cada nodo muestra el precio de KO y el valor de la opción. Usamos la IV del árbol para que el árbol arranque en el precio real de mercado. Los nodos en rojo son en los que conviene ejercer antes.
+
+```{r niveles-nodos, fig.width = 11, fig.height = 5.5}
+dibujar_arbol <- function(tipo, K, titulo) {
+  f <- tabla %>% filter(vencimiento == as.Date("2026-12-18"), tipo == !!tipo, strike == K)
+  T <- as.numeric(as.Date("2026-12-18") - hoy) / 365; tD <- as.numeric(fecha_exdiv - hoy) / 365
+  a7 <- arbol_americano(S0, K, T, r, f$iv_arbol, tipo, dividendo, tD, N = 7, detalle = TRUE)
+  a300 <- arbol_americano(S0, K, T, r, f$iv_arbol, tipo, dividendo, tD, N = 300)$valor
+  nd <- a7$nodos %>% mutate(x = paso, y = sube - paso / 2,
+                            etiqueta = paste0("KO ", formatC(S, format = "f", digits = 1), "\n", ifelse(tipo == "call", "C ", "P "), formatC(V, format = "f", digits = 2)))
+  aristas <- nd %>% filter(paso < 7) %>%
+    crossing(mov = c(0, 1)) %>% transmute(x = paso, y = y, xend = paso + 1, yend = sube + mov - (paso + 1) / 2)
+  semana <- format(hoy + 7 * (0:7), "%d-%b")
+  ggplot() +
+    geom_segment(data = aristas, aes(x, y, xend = xend, yend = yend), color = "grey75") +
+    geom_vline(xintercept = as.numeric(fecha_exdiv - hoy) / 7, linetype = "dashed", color = "#e0a100") +
+    annotate("text", x = as.numeric(fecha_exdiv - hoy) / 7, y = 4.1, label = "ex-dividendo 1-dic", size = 3, color = "#b07d00") +
+    geom_label(data = nd, aes(x, y, label = etiqueta, fill = ejerce & paso < 7), size = 2.6, label.padding = unit(0.12, "lines")) +
+    scale_fill_manual(values = c(`FALSE` = "white", `TRUE` = "#f4c7c3"), guide = "none") +
+    scale_x_continuous(breaks = 0:7, labels = semana) +
+    labs(title = titulo,
+         subtitle = paste0("σ = ", pct(f$iv_arbol), ", u = ", round(a7$u, 4), ", d = ", round(a7$d, 4), ", p = ", round(a7$p, 4),
+                           " | árbol 7 pasos: US$", round(a7$valor, 3), " | 300 pasos: US$", round(a300, 3), " | mercado: US$", round(f$mid, 3)),
+         x = NULL, y = NULL) +
+    theme_minimal() + theme(axis.text.y = element_blank(), panel.grid = element_blank())
+}
+dibujar_arbol("call", 97.5, "Call americana KO, strike 97.50, vence 18-dic-2026 (estrategia 1, la que compramos)")
+dibujar_arbol("put", 90, "Put americana KO, strike 90, vence 18-dic-2026 (estrategia 2, la que compramos)")
+```
+
+**Lectura de los árboles.**
+
+* **Call 97.50:** en los nodos de arriba (KO sube) la call gana valor rápido; en los de abajo vale casi cero. Solo conviene ejercerla antes en un nodo muy alto, justo antes del ex-dividendo, para quedarse con el dividendo. Con 7 pasos el árbol ya da un precio muy cercano al de 300 pasos y al de mercado.
+* **Put 90:** es al revés, gana valor cuando KO baja. En los nodos más bajos conviene ejercerla antes: si KO cae mucho, es mejor cobrar los US\$90 hoy y ganar intereses que esperar.
+
+## 6. Estrategias en Investopedia y rentabilidad esperada a 2 semanas
+
+### Qué compramos y por qué
+
+Armamos **dos estrategias** sobre las mismas 100 acciones de KO:
+
+* **Estrategia 1, acciones + call 97.50 (para ganar más si KO sube):** la call nos da ganancia extra si KO pasa de US\$97.50.
+* **Estrategia 2, put protectora de 90 (para limitar la pérdida si KO cae):** la put funciona como un seguro, porque si KO baja de US\$90 la put gana lo que pierden las acciones.
+
+Juntas, el portafolio queda **protegido abajo de US\$90 y con más ganancia arriba de US\$97.50**. En medio, se comporta como tener solo las acciones, menos lo que costaron las dos opciones.
+
+```{r posicion}
+# ---- Posición comprada (ejecutada a la apertura del lunes 2-nov-2026) ----
+n_acciones    <- 100      # 97 + 3 acciones, órdenes "Buy at Market Open"
+precio_accion <- 94.28    # precio real de ejecución, 2-nov-2026 (Investopedia, Trade History)
+precio_call   <- 1.32     # precio real de la call 97.50 dic-2026 (KO2618L97.5)
+precio_put    <- 1.09     # precio real de la put 90 dic-2026 (KO2618X90)
+K_call <- 97.5; K_put <- 90
+
+inversion <- n_acciones * precio_accion + 100 * (precio_call + precio_put)
+equilibrio_call <- K_call + precio_call
+```
+
+```{r tarjetas-posicion, echo = FALSE}
+fila(
+  tarjeta("100 acciones", "KO a US$94.28", usd(n_acciones * precio_accion, 0)),
+  tarjeta("1 call 97.50", "Estrategia 1 · KO2618L97.5, vence 18-dic", paste0("Prima ", usd(100 * precio_call, 0))),
+  tarjeta("1 put 90", "Estrategia 2 · KO2618X90, vence 18-dic", paste0("Prima ", usd(100 * precio_put, 0))),
+  tarjeta(usd(inversion, 0), "Inversión total", "Antes de comisiones (US$0 en Investopedia)", color = "#C8102E"),
+  tarjeta(pct(100 * (precio_call + precio_put) / (n_acciones * precio_accion), 1), "Costo de las dos opciones", "Como % del valor de las acciones"),
+  tarjeta(paste0(usd(K_put, 0), " / ", usd(K_call, 2)), "Piso y punto de arranque", "Abajo de 90 protege; arriba de 97.50 acelera")
+)
+```
+
+* **Por qué no una *covered call*:** era nuestra primera idea (comprar acciones y vender calls para cobrar la prima), pero el simulador de Investopedia solo permite **Buy To Open** y **Sell To Close**, es decir, solo se pueden vender opciones que ya compraste.
+* **Por qué la call:** somos moderadamente optimistas con KO. Superó la utilidad esperada en el 3T (US\$0.91 vs. US\$0.88), los analistas tienen un precio objetivo promedio de US\$97.98 y el Monte Carlo da un poco más de probabilidad de subir que de bajar. El strike de 97.50 está justo en el precio objetivo y es de los contratos con más operación (volumen de 511 y 3,346 contratos abiertos).
+* **Por qué la put:** la tendencia de KO en 2026 ha sido muy fuerte (de ~US\$67 a US\$94), así que una corrección es posible. La put de 90 está cerca de un nivel donde KO se ha detenido antes (se ve en la gráfica de TradingView) y cuesta poco.
+* **Por qué las dos con vencimiento en diciembre:** son opciones americanas de 1–2 meses, como pide la tarea, y el GARCH dice que su precio es justo (la volatilidad implícita de ~20% es casi igual a la pronosticada).
+* **Qué arriesgamos:** lo máximo que se puede perder en las opciones es lo que costaron (~US\$`r round(100 * (precio_call + precio_put))`). Con la put, la pérdida máxima del portafolio al 18-dic queda limitada a unos US\$`r round(n_acciones * (precio_accion - K_put) + 100 * (precio_call + precio_put) - n_acciones * dividendo)`, aunque KO caiga mucho.
+
+### Ganancia esperada al 13 de noviembre (entrega del proyecto)
+
+Al día de entrega revaluamos cada opción con el árbol americano (misma volatilidad, `r as.numeric(as.Date("2026-12-18") - entrega)` días por vencer) y el precio de KO sale de las trayectorias del Monte Carlo GARCH.
+
+```{r pnl}
+T_resto <- as.numeric(as.Date("2026-12-18") - entrega) / 365
+tD_resto <- as.numeric(fecha_exdiv - entrega) / 365
+iv_call <- tabla %>% filter(vencimiento == as.Date("2026-12-18"), tipo == "call", strike == K_call) %>% pull(iv_arbol)
+iv_put  <- tabla %>% filter(vencimiento == as.Date("2026-12-18"), tipo == "put", strike == K_put) %>% pull(iv_arbol)
+
+# Valor de las opciones el 13-nov para una rejilla de precios de KO (después se interpola para cada escenario)
+rejilla <- tibble(S = seq(70, 125, by = 0.25)) %>%
+  mutate(call = map_dbl(S, ~ arbol_americano(.x, K_call, T_resto, r, iv_call, "call", dividendo, tD_resto, N = 150)$valor),
+         put  = map_dbl(S, ~ arbol_americano(.x, K_put, T_resto, r, iv_put, "put", dividendo, tD_resto, N = 150)$valor))
+call_13nov <- approxfun(rejilla$S, rejilla$call, rule = 2)
+put_13nov  <- approxfun(rejilla$S, rejilla$put, rule = 2)
+
+pnl <- function(S) {
+  acc  <- n_acciones * (S - precio_accion)
+  call <- 100 * (call_13nov(S) - precio_call)
+  put  <- 100 * (put_13nov(S) - precio_put)
+  tibble(`Portafolio completo (lo que compramos)` = acc + call + put,
+         `Estrategia 1: acciones + call 97.50` = acc + call,
+         `Estrategia 2: acciones + put 90` = acc + put,
+         `Referencia: solo 100 acciones` = acc)
+}
+
+escenarios <- pnl(S_entrega)
+resumen <- map_dfr(names(escenarios), function(est) {
+  x <- escenarios[[est]]
+  tibble(Estrategia = est,
+         `Si KO no se mueve` = pnl(precio_accion)[[est]],
+         `Ganancia esperada` = mean(x),
+         `Probabilidad de ganar` = mean(x > 0),
+         `Peor 5%` = quantile(x, 0.05), `Mejor 5%` = quantile(x, 0.95))
+})
+datatable(resumen, rownames = FALSE, options = list(dom = "t", ordering = FALSE),
+          caption = "Resultado al 13-nov-2026 (US$), 20,000 escenarios del Monte Carlo GARCH") %>%
+  formatRound(c(2, 3, 5, 6), 0) %>% formatPercentage(4, 0)
+
+curva_pnl <- pnl(rejilla$S) %>% mutate(S = rejilla$S) %>% pivot_longer(-S, names_to = "Estrategia", values_to = "PnL")
+plot_ly(curva_pnl, x = ~S, y = ~PnL, color = ~Estrategia, colors = c("#7a8ca0", "#1F3B5C", "#C8102E", "#c9cdd2"), type = "scatter", mode = "lines") %>%
+  add_trace(x = S_entrega, type = "histogram", yaxis = "y2", name = "Escenarios de KO al 13-nov", marker = list(color = "rgba(150,150,150,0.25)"),
+            inherit = FALSE, nbinsx = 60) %>%
+  layout(title = list(text = "Ganancia o pérdida al 13-nov según el precio de KO", font = list(size = 15)),
+         xaxis = list(title = "Precio de KO el 13-nov (US$)", range = c(80, 110)), yaxis = list(title = "US$"),
+         yaxis2 = list(overlaying = "y", side = "right", showgrid = FALSE, showticklabels = FALSE),
+         legend = list(orientation = "h", y = -0.2))
+```
+
+```{r tarjetas-pnl, echo = FALSE}
+mi <- resumen %>% filter(Estrategia == "Portafolio completo (lo que compramos)")
+signo <- function(x) paste0(ifelse(x < 0, "−", "+"), usd(abs(x), 0))
+fila(
+  tarjeta(signo(mi$`Ganancia esperada`), "Ganancia esperada al 13-nov", paste0(pct(mi$`Ganancia esperada` / inversion, 2), " de la inversión"), color = "#C8102E"),
+  tarjeta(pct(mi$`Probabilidad de ganar`, 0), "Probabilidad de terminar con ganancia"),
+  tarjeta(signo(mi$`Si KO no se mueve`), "Resultado si KO no se mueve", "Lo que pierden las opciones por el paso del tiempo")
+)
+```
+
+### Resultado al vencimiento de las opciones (18-dic-2026)
+
+```{r pnl-vencimiento}
+pnl_vto <- function(S) {
+  acc <- n_acciones * (S - precio_accion) + n_acciones * dividendo
+  tibble(`Portafolio completo` = acc + 100 * (pmax(S - K_call, 0) - precio_call) + 100 * (pmax(K_put - S, 0) - precio_put),
+         `Solo acciones` = acc)
+}
+x_vto <- pnl_vto(S_dic)$`Portafolio completo`
+perdida_max <- min(pnl_vto(seq(50, 90, by = 0.5))$`Portafolio completo`)
+tibble(S = seq(75, 115, by = 0.5)) %>%
+  bind_cols(pnl_vto(.$S)) %>%
+  pivot_longer(-S, names_to = "Estrategia", values_to = "PnL") %>%
+  plot_ly(x = ~S, y = ~PnL, color = ~Estrategia, colors = c("#C8102E", "#7a8ca0"), type = "scatter", mode = "lines") %>%
+  add_lines(x = c(K_put, K_put), y = c(-2000, 3000), name = "Put 90", line = list(color = "grey", dash = "dot"), inherit = FALSE) %>%
+  add_lines(x = c(K_call, K_call), y = c(-2000, 3000), name = "Call 97.50", line = list(color = "grey", dash = "dash"), inherit = FALSE) %>%
+  layout(title = list(text = "Ganancia o pérdida al 18-dic (incluye dividendo de US$0.53 por acción)", font = list(size = 15)),
+         xaxis = list(title = "Precio de KO el 18-dic (US$)"), yaxis = list(title = "US$"), legend = list(orientation = "h", y = -0.2))
+```
+
+**Lectura.**
+
+* **A 2 semanas** esperamos un resultado pequeño de `r signo(mi$"Ganancia esperada")` (`r pct(mi$"Ganancia esperada" / inversion, 2)` de lo invertido), con `r pct(mi$"Probabilidad de ganar", 0)` de probabilidad de terminar en positivo. En tan poco tiempo casi todo depende de las acciones.
+* **Si KO no se mueve**, el resultado es de `r signo(mi$"Si KO no se mueve")`: es lo que las dos opciones pierden de valor con el paso del tiempo (theta). Es lo que "pagamos" por el seguro de la put y por la ganancia extra de la call.
+* **Comparando estrategias:** la estrategia 1 tiene la mejor ganancia en el mejor 5% de escenarios; la estrategia 2 tiene la pérdida más chica en el peor 5%. El portafolio completo queda en medio: perdemos un poco menos que con solo acciones si KO cae y ganamos un poco más si sube.
+* **Al 18 de diciembre:** abajo de US\$90 la pérdida ya no crece (máximo unos US\$`r round(-perdida_max)`), y arriba de US\$97.50 ganamos US\$200 por cada dólar que suba KO en vez de US\$100. También cobramos el dividendo del 1-dic (US\$53).
+* Con el Monte Carlo, la ganancia esperada al vencimiento es de US\$`r round(mean(x_vto))` con `r pct(mean(x_vto > 0), 0)` de probabilidad de ganar.
+
+## 7. Hallazgos, interpretación y propuestas
+
+**Hallazgos**
+
+1. El GARCH de KO tiene persistencia de `r round(a + b, 2)`: los choques de volatilidad duran semanas, no días. Hoy la volatilidad (`r pct(vol_hoy)`) está arriba de lo normal (`r pct(vol_lp)`) por los movimientos fuertes de finales de octubre y se espera que baje poco a poco.
+2. El GARCH explica mejor los datos que la volatilidad constante y que EWMA, y pasa el back testing del VaR.
+3. A 1–3 meses, la volatilidad implícita del mercado (~20%) es casi igual a la del GARCH: las opciones de KO tienen un precio justo y no hay una oportunidad clara de "comprar volatilidad barata".
+4. Poder ejercer antes (opción americana) vale unos centavos cerca del dinero; solo pesa en opciones muy dentro del dinero, en las calls por el dividendo del 1-dic.
+5. Para el proyecto final, la volatilidad promedio a 6 años según el GARCH es `r pct(vol_promedio(1512))`; la usamos como escenario para el cupón del bono convertible (ver avance 2).
+
+**Propuestas**
+
+* Mantener las dos estrategias hasta la entrega y comparar el resultado real contra este pronóstico (tabla de abajo).
+* Si KO baja de US\$90, la put ya nos protege; además podemos vender la call (Sell To Close) para recuperar lo que quede de su prima.
+* Si KO sube arriba de US\$97.50 antes del 1-dic, evaluar vender la call antes del ex-dividendo para asegurar la ganancia, y vender la put para recuperar algo de su valor.
+
+### Seguimiento: pronóstico vs. resultado real
+
+La entrega del proyecto se adelantó al domingo 8-nov, así que comparamos contra el **último cierre disponible, el viernes 6-nov-2026** (5 días hábiles después de la compra). Para que la comparación sea justa, sacamos el pronóstico a esa misma fecha de las mismas trayectorias del Monte Carlo (hechas con datos al 30-oct).
+
+```{r seguimiento}
+# ---- Resultado real (Investopedia, cierre del viernes 6-nov-2026) ----
+fecha_real <- as.Date("2026-11-06")
+precio_ko_real  <- 95.67    # KO
+valor_call_real <- 1.74     # call 97.50 (valor total de US$174 en Investopedia)
+valor_put_real  <- 0.81     # put 90 (valor total de US$81 en Investopedia)
+
+# ---- Pronóstico a la misma fecha con el Monte Carlo GARCH ----
+dias_real <- dias_habiles(hoy, fecha_real)
+S_real_mc <- camino[dias_real + 1, ]
+T_r  <- as.numeric(as.Date("2026-12-18") - fecha_real) / 365
+tD_r <- as.numeric(fecha_exdiv - fecha_real) / 365
+rej_r <- tibble(S = seq(70, 125, by = 0.25)) %>%
+  mutate(call = map_dbl(S, ~ arbol_americano(.x, K_call, T_r, r, iv_call, "call", dividendo, tD_r, N = 150)$valor),
+         put  = map_dbl(S, ~ arbol_americano(.x, K_put, T_r, r, iv_put, "put", dividendo, tD_r, N = 150)$valor))
+call_r <- approxfun(rej_r$S, rej_r$call, rule = 2); put_r <- approxfun(rej_r$S, rej_r$put, rule = 2)
+pnl_r <- function(S, c, p) n_acciones * (S - precio_accion) + 100 * (c - precio_call) + 100 * (p - precio_put)
+pnl_mc_r <- pnl_r(S_real_mc, call_r(S_real_mc), put_r(S_real_mc))
+pnl_real <- pnl_r(precio_ko_real, valor_call_real, valor_put_real)
+
+seguimiento <- tibble(
+  Concepto = c("Precio de KO", "Valor de la call 97.50 (por acción)", "Valor de la put 90 (por acción)", "Ganancia del portafolio (US$)"),
+  `Pronóstico al 6-nov (mediana / esperado)` = c(median(S_real_mc), call_r(median(S_real_mc)), put_r(median(S_real_mc)), mean(pnl_mc_r)),
+  `Real al 6-nov` = c(precio_ko_real, valor_call_real, valor_put_real, pnl_real),
+  `Lo que valía el árbol con el precio real` = c(precio_ko_real, call_r(precio_ko_real), put_r(precio_ko_real),
+                                                  pnl_r(precio_ko_real, call_r(precio_ko_real), put_r(precio_ko_real))))
+datatable(seguimiento, rownames = FALSE, options = list(dom = "t", ordering = FALSE)) %>% formatRound(2:4, 2)
+```
+
+```{r tarjetas-seguimiento, echo = FALSE}
+fila(
+  tarjeta(signo(pnl_real), "Ganancia real al 6-nov", paste0(pct(pnl_real / inversion, 2), " de la inversión"), color = "#C8102E"),
+  tarjeta(pct(mean(pnl_mc_r <= pnl_real), 0), "Escenarios del Monte Carlo con resultado menor o igual al real", "Qué tan bueno fue el resultado frente al pronóstico"),
+  tarjeta(pct(precio_ko_real / precio_accion - 1, 2), "Cambio de KO desde la compra", "De US$94.28 a US$95.67")
+)
+```
+
+**Lectura.** KO subió de US\$94.28 a US\$95.67 en la primera semana, así que la posición ganó **`r signo(pnl_real)`**: las acciones ganaron US\$139, la call US\$42 y la put perdió US\$28. Es más de lo que esperábamos (`r signo(mean(pnl_mc_r))` en promedio), porque KO subió más de lo que esperaba el modelo: `r pct(1 - mean(pnl_mc_r <= pnl_real), 0)` de los escenarios del Monte Carlo daban un resultado mejor que el real. La última columna muestra que el árbol valuaba bien las opciones: con el precio real de KO, el árbol da valores muy cercanos a los de Investopedia. Como esperábamos, la put perdió valor porque KO se alejó de US\$90 y por el paso del tiempo, pero cumplió su papel de seguro.
+
+## 8. Evidencia
+
+### Investopedia
+
+```{r evidencia-investopedia, echo = FALSE, results = "asis", out.width = "90%"}
+anchos <- c(investopedia_contrato_call = 85, investopedia_orden_acciones = 45, investopedia_pendientes_acciones = 85,
+            investopedia_pendiente_call = 85, investopedia_historial = 85, investopedia_holdings_acciones = 90, investopedia_holdings_opciones = 90)
+capturas <- c("capturas/investopedia_contrato_call.png" = "Contrato KO2618L97.5 (call 97.50, 18-dic-2026): bid 1.28, ask 1.37. El simulador solo permite Buy To Open o Sell To Close.",
+              "capturas/investopedia_orden_acciones.png" = "Orden de compra de KO a mercado (97 acciones).",
+              "capturas/investopedia_pendientes_acciones.png" = "Órdenes pendientes: 97 + 3 acciones de KO a la apertura del lunes (100 en total).",
+              "capturas/investopedia_pendiente_call.png" = "Órdenes pendientes: compra de 1 call KO 97.50 (estrategia 1) y 1 put KO 90 (estrategia 2), vencimiento 18-dic-2026, a la apertura.",
+              "capturas/investopedia_historial.png" = "Trade History: ejecución el 2-nov-2026 de 97 + 3 acciones de KO a US$94.28, la put 90 a US$1.09 y la call 97.50 a US$1.32.",
+              "capturas/investopedia_holdings_acciones.png" = "Holdings de acciones al cierre del 6-nov-2026: KO a US$95.67 (+US$139) y AAPL (+US$565).",
+              "capturas/investopedia_holdings_opciones.png" = "Holdings de opciones al cierre del 6-nov-2026: call 97.50 vale US$174 (+US$42) y put 90 vale US$81 (−US$28).")
+for (f in names(capturas)) {
+  if (file.exists(f)) cat(paste0("![", capturas[[f]], "](", f, "){width=", anchos[[tools::file_path_sans_ext(basename(f))]], "%}\n\n"))
+  else cat(paste0("*Pendiente:* ", capturas[[f]], " (guardar como `", f, "`)\n\n"))
+}
+```
+
+### CME y TradingView
+
+```{r evidencia-otros, echo = FALSE, results = "asis"}
+otras <- c("capturas/tradingview_ko.png" = "TradingView: KO diario a 2 años con líneas en 90 (strike de la put), 97.49 (strike de la call) y 98.85 (punto de equilibrio de la call). Se ve la fuerte subida de 2026 y que KO ya se detuvo antes cerca de 90.",
+           "capturas/cme_posiciones.png" = "CME Group (cuenta de práctica), cierre del 6-nov-2026: 2 E-mini S&P 500 largos (ESZ6), 1 Micro E-mini Nasdaq-100 corto (MNQZ6) y 1 call de petróleo WTI 88.5 (CLE6).")
+for (f in names(otras)) {
+  if (file.exists(f)) cat(paste0("![", otras[[f]], "](", f, "){width=90%}\n\n"))
+  else cat(paste0("*Pendiente:* ", otras[[f]], " (guardar como `", f, "`)\n\n"))
+}
+```
+
+### Datos de LSEG
+
+| Archivo en `datos/` | Pantalla de LSEG | Se usa en |
+|---|---|---|
+| KO_precios_5a.xlsx | KO.N → Price & Charts → Price History (5 años, diario) | Volatilidad, GARCH, Monte Carlo, back testing |
+| KO_opciones_1a3m.csv | KO.N → Derivatives → Options (18-dic-2026 y 15-ene-2027) | Volatilidad implícita, árboles americanos, estrategia |
+
+**Supuestos:** fecha ex-dividendo estimada el 1-dic-2026 (en 2024 fue el 29-nov y en 2025 el 1-dic) y tasa libre de riesgo igual a la de fondos federales (4.08%), que según LSEG está a 2–6 puntos base de SOFR.
